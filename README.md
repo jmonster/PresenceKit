@@ -1,153 +1,121 @@
 # PresenceKit
 
-Local, budgeted room-presence sensing for macOS. **Swift 6, macOS 13+, Intel and Apple silicon, no third-party package dependencies.** Motion is the default; Apple Vision human/face rectangles are optional, additive evidence. The library does not identify people, record images, upload frames, install a daemon, play media, or change power policy.
+Local, budgeted room-presence sensing for **Swift 6 / macOS 13+**, on Intel and Apple silicon. No third-party package dependencies. Motion is the baseline; Apple Vision human/face rectangles are optional additive evidence, not identification. Images are not recorded or uploaded.
 
-This is a prerelease package. The lifecycle/budget hardening revision addresses the five findings in the source audit; see [CHANGELOG](CHANGELOG.md) and the [release contract](docs/RELEASE_CONTRACT.md). A green software test suite is not a claim of detection accuracy or measured whole-system energy savings.
+Two importable products separate sensing from action:
+
+- **PresenceKit** provides `PresenceMonitor` for raw state changes and `PresenceAutomation` for supervised recovery and recognition-fallback decisions.
+- **PresencePlayback** provides `PresencePlayerController`, coordinating an AVPlayer with optional display power management, feedback suppression, recovery and failure cleanup.
+
+`PresenceAgent` is the standalone menu-bar player built on the same public controller. This is a source prerelease, not a notarized end-user binary or a 1.0 API-stability promise.
 
 ## Add to an application
 
-In Xcode add `https://github.com/jmonster/PresenceKit` and select the `PresenceKit` library product. Until a release tag is published, choose `main` and commit `Package.resolved`, or pin an inspected commit using `.revision(...)`.
+Add this repository in Xcode and select both library products for the player integration. A published version can be pinned with:
 
 ```swift
-// Package dependencies:
-.package(url: "https://github.com/jmonster/PresenceKit.git", branch: "main")
+.package(url: "https://github.com/jmonster/PresenceKit.git", exact: "0.1.0-beta.2")
 
 // Application target dependencies:
-.product(name: "PresenceKit", package: "PresenceKit")
+.product(name: "PresenceKit", package: "PresenceKit"),
+.product(name: "PresencePlayback", package: "PresenceKit")
 ```
 
-Add `NSCameraUsageDescription` to the host application's Info.plist. Enable its camera entitlement when sandboxing/hardened-runtime settings require it. The camera indicator remains visible during capture. Permission is requested from your application when monitoring starts; the package cannot grant permission or bypass the lock screen.
+During development, use a tested commit with `.package(url: ..., revision: "FULL_SHA")`. Version tags are created only after complete main-branch CI succeeds.
 
-## Drive a media player
+The host application needs `NSCameraUsageDescription` and the camera entitlement when its sandbox/hardened-runtime settings require it. Camera consent belongs to your app; the camera indicator remains visible. No root access is required.
 
-Call this from SwiftUI `.task`, or another task whose lifetime matches the feature. Cancelling that task stops monitoring; no independent subscription/timer needs cancellation.
+## Unattended media playback
 
 ```swift
 import AVFoundation
 import PresenceKit
+import PresencePlayback
 
 @MainActor
-func followPresence(player: AVPlayer) async throws {
+func runPlayer(player: AVPlayer) async throws {
     var config = PresenceConfiguration.lowPower
     config.absenceDelay = .seconds(120)
-    let monitor = try PresenceMonitor.camera(configuration: config)
-
-    try await monitor.run { @MainActor event in
-        switch event {
-        case .presenceChanged(let change):
-            switch change.current {
-            case .present: player.play()
-            case .absent: player.pause()
-            case .unknown:
-                // Application policy: pause when sensing is unreliable.
-                // Unknown is NOT a claim that the room is empty.
-                player.pause()
-            }
-        case .statusChanged(let status):
-            // Surface degradation/failure in your UI or structured logging.
-            print("PresenceKit status: \(status)")
-        case .lightingChanged(_, let current):
-            print("Room lighting: \(current)")
-        }
+    let controller = try PresencePlayerController(
+        player: player,
+        configuration: config,
+        fallback: .motionOnly(additionalAbsenceDelay: .seconds(120)),
+        manageDisplay: true
+    )
+    try await controller.run { event in
+        print(event) // Surface recovery/degradation in your application's UI.
     }
 }
 ```
 
-Handle `CancellationError` as normal shutdown and other errors visibly. The complete [`PlayerPresence`](Examples/PlayerPresence.swift) example does this. Keep callbacks short and cancellation-cooperative. They are awaited in order by one consumer, independently of camera capture; they do not implicitly run on MainActor. Do not launch a detached task on every event.
+Run this from SwiftUI `.task` or one AppKit-owned task. Cancellation pauses playback, releases owned power assertions and awaits capture cleanup. Retain one controller; do not independently drive the same player while it owns playback. Construction itself opens no camera and changes no power setting. [The full example](Examples/PlayerPresence.swift) handles terminal errors.
 
-### Presence and operational events
+Transient camera faults retry at 2, 4, 8, 16, 32, then 60 seconds by default. Sessions never overlap. A sustained healthy run resets backoff; merely starting a session does not. Permission/configuration errors, unsupported capture caps, an unanswered startup deadline, consumer overload and media/power failures stop for correction rather than retrying forever. `PresenceRetryPolicy.maximumRetries` optionally limits transient retries.
 
-An initial `unknown` snapshot is delivered before startup. After that, presence events are changes of state, not periodic "still present" callbacks. Positive evidence refreshes the absence timer without repeatedly starting the player.
+On present: suppress motion feedback, wake/hold the display, then show/play media. On absent: pause/hide, suppress feedback, release the hold and request display sleep. Recent user input declines forced sleep. On unknown or failure: pause/hide and release display holds, but **never force the display off based on missing observations**. Power control is opt-in and uses scoped assertions, not persistent system settings. Monitoring remains awake through transient retries only when requested.
 
-| State | Meaning |
-| --- | --- |
-| `present` | Accepted motion or a positive human/face result. |
-| `absent` | No accepted evidence for `absenceDelay`, with fresh observations and no overdue active recognition contract. |
-| `unknown` | Startup, unavailable/stale analysis, an overdue recognizer at the absence decision, or invalidated state after failure/cancellation. |
-
-`PresenceEvent.statusChanged` is separate from occupancy. It reports `.starting`, `.running`, `.stopped`, `.failed(PresenceError)`, `.analysis(AnalysisStatus)`, or `.recognition(RecognitionStatus)`. Analysis status distinguishes warmup, active, throttled, and stale. Recognition status distinguishes disabled, active, thermal pressure, a missed cadence, and typed failure reasons (frame-copy failure, inference error, duration budget exceeded). Repeated identical analysis/recognition statuses are suppressed.
-
-An explicitly failed or thermally paused recognizer falls back to motion-only, with a status event. Stationary-occupant protection is then unavailable. Applications requiring that protection should handle the status instead of assuming every `absent` decision used a functioning recognizer. A recognizer advertised as active but missing its result deadline instead reports `cadenceExceeded`; an expired presence decision becomes unknown rather than a silent departure.
-
-## Low-compute defaults
-
-Motion uses a 96 x 72 luminance grid with a nominal 500 ms sample interval. The camera requests 5 fps and refuses formats above 640 x 480 or 10 fps by default. Unsupported low-rate formats fail explicitly rather than silently exceeding the caps. Entry requires two positive samples within two seconds; absence defaults to 120 seconds. Warmup is three seconds. Approximately 1–2 seconds of continuing visible motion after warmup is a design target, not a maximum-latency guarantee.
-
-Each work gate skips overdue work instead of catching up. Next admission is no earlier than both the minimum interval and `completion + cost * (1 / duty - 1)`. Motion defaults to a 2% measured elapsed-time duty target; optional Vision defaults to 1%. These are NOT CPU percentages or watts. Camera transport, framework parallelism, hardware power, and the host player must still be considered.
-
-A lightweight frame-delivery heartbeat is independent of analysis admission. Lowering the compute budget therefore cannot masquerade as a dead camera. If analysis becomes too stale, presence becomes unknown and analysis status becomes stale, but a delivering camera remains running and can recover. Cached evidence and lighting retain their original timestamps: heartbeats cannot manufacture confirmations or refresh an old positive result.
-
-## Optional human or face evidence
-
-```swift
-var config = PresenceConfiguration.lowPower
-config.vision.mode = .humanRectangles   // or .faceRectangles
-config.vision.compute = .automatic     // .cpuOnly is a compatibility option
-config.absenceDelay = .seconds(240)
-```
-
-Recognition is admitted independently of motion, so a motion budget cooldown does not prevent periodic stationary-person checks. At most one request is in flight. Automatic compute lets Vision select supported execution; a Neural Engine is not required. CPU-only is not assumed to use less energy.
-
-Configuration validation accounts for the **budgeted**, not merely nominal, recognition interval:
-
-```text
-worst interval = max(minimumInterval, maximumInferenceDuration / maximumDutyCycle)
-required absence delay = 2 * worst interval + sensorTimeout
-```
-
-With the default one-second maximum duration and 1% duty target, the minimum accepted delay is 208 seconds; 240 seconds is the example policy. A 20-second absence delay with those budgets is rejected with a useful error. The bound reserves two recognition opportunities, plus observation-freshness allowance; it is not a promise that the model recognizes every person.
-
-Measured Vision cost includes the frame copy and queue delay. A request exceeding the completed-duration ceiling disables later Vision work for that run and emits a typed failure. The in-progress synchronous request cannot be forcibly preempted. The runtime result deadline catches unexpected cadence overruns. Serious/critical thermal pressure pauses new requests with explicit fallback status.
-
-## Lifecycle and ownership
-
-`run()` suspends until cancellation or failure. A second concurrent run on the same monitor throws `alreadyRunning`. A monitor can restart after its previous run and cleanup finish. The default `startupTimeout` is 60 seconds and includes permission waiting.
-
-The permission bridge releases its Swift waiter on cancellation or startup timeout and ignores late/duplicate callbacks. This does not dismiss Apple's permission dialog. Startup deadlines are cooperative: a synchronous driver operation or custom source that never returns cannot be safely killed. Such work is drained before the owning task returns.
-
-On failure, `currentState` is invalidated as soon as the coordinator observes it, before waiting for a blocked callback. Once that callback cooperates, the terminal unknown/status events are delivered **before** camera/inference cleanup is awaited. Cleanup can take time; the application is not left with a known-present state solely because cleanup is slow. A callback that never returns still prevents ordered delivery and structured shutdown.
-
-Custom sources now return an exclusive `PresenceSession` from `start()` rather than a stream plus a global `stop()` method. Only a successfully acquired session is stopped. Failed starts must unwind their own partial resources. Session stop is idempotent and concurrent callers await the same cleanup. See the migration details in the [release contract](docs/RELEASE_CONTRACT.md).
-
-`PresenceClock` can be injected into a monitor and camera source; use one clock domain for source timestamps and deadlines. The tests include a cancellation-aware virtual clock. The [architecture guide](docs/ARCHITECTURE.md) documents confinement, buffering, and startup races.
-
-## Light and power integration
-
-`lightingChanged` uses hysteresis and continuous sampled dwell. Camera luminance is a heuristic, not a lux measurement. Automatic exposure, scene composition, and the display itself affect it. Setting `light.legacyCalibration` opts into the undocumented `AppleLMUController` backend; use measured raw `darkBelow`/`brightAbove` values for your machine. Without that calibration it is not probed. Camera brightness is the fallback. Light alone never asserts occupancy.
-
-Keep a `CameraPresenceSource` reference when diagnostics or suppression are needed:
+## Callback-only integration
 
 ```swift
 let source = try CameraPresenceSource(configuration: config)
-let monitor = try PresenceMonitor(source: source, configuration: config)
-// After the host changes its display/backlight:
-await source.suppressMotion(for: .seconds(3))
-// Inspect configured format, measured intervals, and typed recognition status:
-let statistics = await source.statistics()
+let automation = try PresenceAutomation(source: source, configuration: config)
+try await automation.run { event in
+    if case .activityChanged(let state) = event {
+        // Hop to MainActor for UI work. Handle present, absent and unknown.
+        print(state)
+    }
+}
 ```
 
-The host owns display/system-sleep policy. Monitoring needs an awake computer; a sleeping iMac cannot analyze its camera. Display sleep is separate. Pausing media should also stop unnecessary decoding/rendering. **No software setting proves this costs less than leaving the display on.** The [power acceptance procedure](docs/POWER.md) defines the whole-system break-even calculation; the scheduler does not enforce a wattage limit.
+Apply actions to `activityChanged`, the fallback-adjusted decision. `sensing` contains raw `PresenceEvent` values; `recovery` reports monitoring, scheduled retries, stopped and terminal failure. Callbacks are serialized, bounded and asynchronous. They are not implicitly MainActor-isolated at this layer and must be short/cancellation-cooperative. No task is spawned per camera frame.
 
-## Standalone demonstration
+The original `PresenceMonitor.run` and its `PresenceEvent` callback remain available for fully custom policy. Presence events are transitions, not periodic "still present" messages. `present` means accepted evidence; `absent` means no accepted evidence within the configured delay while observations remain fresh; `unknown` means sensing is not currently reliable enough to decide. Absence is not proof of physical vacancy.
 
-The separate `PresenceAgent` product demonstrates a menu-bar app, local movie pause/resume, optional display management, and retry backoff. It is not required when importing the library.
+## Low-compute defaults and optional recognition
+
+Motion compares a 96 x 72 luminance grid at a nominal 500 ms interval. The camera requests 5 fps and refuses formats above 640 x 480 or 10 fps. Entry needs two positive samples within two seconds; absence defaults to 120 seconds; warmup is three seconds. Roughly 1–2 seconds of continuing visible motion after warmup is a design target, not a guaranteed maximum latency.
+
+```swift
+config.vision.mode = .humanRectangles // or .faceRectangles
+config.vision.compute = .automatic   // .cpuOnly is a compatibility escape hatch
+config.absenceDelay = .seconds(240)
+```
+
+Recognition runs independently of motion, with one request in flight. It can refresh presence for stationary occupants. Configuration must allow two worst-budget recognition intervals plus the sensor timeout. With the default one-second accepted duration and 1% elapsed-time duty target, that minimum is 208 seconds; the example uses 240.
+
+When requested recognition degrades, the default automation policy accepts motion but adds 120 seconds of grace to a pending absence transition. It never delays unknown/error handling. `.pauseUntilRecovered` instead pauses until recognition reports active. This is an availability policy, not a human-only model. Status events expose thermal pauses, inference failure, duration-budget excess, stale analysis and missed cadence.
+
+Motion and recognition use measured elapsed-time scheduling budgets (2% and 1% defaults), not CPU percentages or watts. Overdue work is skipped, never accumulated. Frame-delivery heartbeats are independent of analysis; cached evidence retains its original time. Synchronous system calls and Vision work cannot be forcibly preempted by a Swift deadline.
+
+## Standalone player
 
 ```sh
 bash scripts/build-app.sh
 open build/PresenceAgent.app --args --media /absolute/path/movie.mp4 --manage-display
-# Optional recognition (sets a 240-second absence policy unless overridden):
-open build/PresenceAgent.app --args --human --manage-display
+# Optional recognition and fallback policy:
+open build/PresenceAgent.app --args --media /absolute/path/movie.mp4 --manage-display --human --fallback motion
+# Run at login (normal user, not sudo):
+bash scripts/install-agent.sh --media /absolute/path/movie.mp4 --manage-display
 ```
 
-`--manage-display` opts into keeping the system awake and controlling display sleep. `--keep-awake` keeps the system awake without display control. Recent user input provides a grace check before forced display sleep. There is no screen unlocker or looping-kiosk implementation. Run as your normal user, not root. The scripts also provide installation/removal of a per-user login agent.
+The player validates and loads local finite-duration media asynchronously and loops by default; `--no-loop` plays once. The menu exposes operational state and **Restart monitoring**. `--check-config` validates arguments without camera/display side effects. Installation checks arguments before replacing an existing agent. Crash-only launchd recovery is throttled; deliberate quit stays stopped, and permission/configuration errors remain visible without a restart/prompt loop. Uninstall with `bash scripts/uninstall-agent.sh`.
 
-## Tests and release checks
+This is not a screen unlocker or kiosk lockdown. To change arguments, quit the running app first or reinstall its login configuration.
+
+## Light and energy
+
+Raw sensing includes hysteretic dark/bright events. Camera luminance is a heuristic, not lux. Calibrated `light.legacyCalibration` opts into the undocumented AppleLMUController backend; unavailable readings fall back to the camera. Light changes alone do not establish presence.
+
+The host's display can sleep while the camera is monitored, but the computer must remain awake. Whole-system sleep with occupancy-triggered wake needs an independent sensor. **A processing-duty limit does not enforce an energy advantage over an always-on display.** [POWER.md](docs/POWER.md) gives the complete-system break-even condition.
+
+## Validation and lifecycle contract
 
 ```sh
 swift test
 swift test -c release
+swift run --package-path Examples/PackageClient -c release PackageClient
 ```
 
-The portable suite contains 50 tests, including the five audit regressions, virtual-clock watchdog/startup tests, delayed-cleanup/callback ordering, session ownership, and stale-evidence rejection. macOS additionally exercises pixel-buffer sampling/copying and builds the camera/agent modules. CI runs Intel and Apple-silicon macOS builds, release tests, packaging, and integration-example typechecking, plus Linux core tests. Review the actual CI result for the revision being consumed; a workflow definition alone is not a passed build.
+CI runs native Intel and Apple-silicon debug/release tests, the packaged-agent smoke test, command-line validation, the macOS-13-targeted integration typecheck and an external public-package consumer. Linux Swift 6.0/6.2 exercises portable scheduling, fallback, recovery and output coordination. Native tests use synthetic sensors and mock power outputs; they do not open a camera or force display sleep. Publication requires the full Release gate.
 
-Apple API references: [camera authorization](https://developer.apple.com/documentation/avfoundation/avcapturedevice/requestaccess(for:completionhandler:)), [capture frame handling](https://developer.apple.com/library/archive/technotes/tn2445/_index.html), [human rectangles](https://developer.apple.com/documentation/vision/vndetecthumanrectanglesrequest), [face rectangles](https://developer.apple.com/documentation/vision/vndetectfacerectanglesrequest), [Swift cancellation](https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/).
+See [unattended operation](docs/UNATTENDED.md), [architecture](docs/ARCHITECTURE.md), [release contract](docs/RELEASE_CONTRACT.md) and [changelog](CHANGELOG.md). A green suite is not a measured detection-accuracy or energy benchmark. Repository branch protection needs administration access separate from the CI publication gate.

@@ -1,43 +1,34 @@
 import AVFoundation
 import PresenceKit
+import PresencePlayback
 
-/// Call run() from SwiftUI .task or another lifecycle-owned task.
+/// Retain this in the host. Call run() from SwiftUI .task or one AppKit-owned task.
+/// Transient camera failures are retried automatically. The view/UI should surface
+/// lastStatus; permission/configuration/output failures require explicit correction.
 @MainActor
 final class PlayerPresence {
     let player: AVPlayer
-    private let monitor: PresenceMonitor
+    private let controller: PresencePlayerController
+    private(set) var lastStatus = "Not started"
 
     init(player: AVPlayer) throws {
         self.player = player
         var config = PresenceConfiguration.lowPower
         config.absenceDelay = .seconds(120)
-        // Opt in only after testing on the target Mac:
+        // Optional additive detection. The fallback grace applies only when degraded:
         // config.vision.mode = .humanRectangles
         // config.absenceDelay = .seconds(240)
-        monitor = try PresenceMonitor.camera(configuration: config)
+        controller = try PresencePlayerController(player: player, configuration: config,
+            fallback: .motionOnly(additionalAbsenceDelay: .seconds(120)),
+            manageDisplay: true)
     }
-
     func run() async {
-        let player = player
         do {
-            try await monitor.run { @MainActor event in
-                if case .statusChanged(let status) = event {
-                    print("PresenceKit operational status: \(status)")
-                }
-                guard case .presenceChanged(let change) = event else { return }
-                switch change.current {
-                case .present: player.play()
-                case .absent: player.pause()
-                case .unknown:
-                    // Deliberate failure policy, not a claim of vacancy.
-                    player.pause()
-                }
-            }
+            try await controller.run { [weak self] event in self?.lastStatus = String(describing: event) }
         } catch is CancellationError {
-            // Normal lifecycle shutdown; camera cleanup has completed.
+            lastStatus = "Stopped"
         } catch {
-            player.pause()
-            print("PresenceKit stopped: \(error)")
+            lastStatus = "Needs attention: \(error)"
         }
     }
 }

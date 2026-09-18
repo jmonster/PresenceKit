@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-beta.2
+
+- Add PresenceAutomation with typed recovery and classified capped exponential retries.
+- Add PresencePlayback and PresencePlayerController with tested output ordering, scoped power ownership and AVPlayer error observation.
+- Add bounded recognition-fallback grace and pause-on-degradation policy.
+- Replace the demo retry loop with the public controller; validate arguments, loop loaded local media, expose diagnostics/restart and crash-only login recovery.
+- Preserve the low-level monitor API. Exhaustive error switches must add cameraConfigurationUnsupported.
+- Add portable recovery/output regressions, native controller integration, external-consumer coverage and command-line smoke checks.
+
+
 ## 0.1.0-beta.1 — macOS build and release validation
 
 - Removed the unavailable macOS capture preset. Native device format and frame durations are selected after graph configuration, with pre/post-start and periodic readback validation.

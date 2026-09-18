@@ -8,7 +8,8 @@ let package = Package(
     dependencies: [.package(name: "PresenceKit", path: "../..")],
     targets: [
         .executableTarget(name: "PackageClient", dependencies: [
-            .product(name: "PresenceKit", package: "PresenceKit")
+            .product(name: "PresenceKit", package: "PresenceKit"),
+                .product(name: "PresencePlayback", package: "PresenceKit")
         ])
     ],
     swiftLanguageModes: [.v6]

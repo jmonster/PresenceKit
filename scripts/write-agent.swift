@@ -5,6 +5,8 @@ let plist: [String: Any] = [
     "Label": "io.github.jmonster.PresenceAgent",
     "ProgramArguments": Array(args.dropFirst(2)),
     "RunAtLoad": true,
+    "KeepAlive": ["SuccessfulExit": false],
+    "ThrottleInterval": 30,
     "LimitLoadToSessionType": "Aqua"
 ]
 let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)

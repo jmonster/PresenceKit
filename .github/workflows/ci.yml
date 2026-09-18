@@ -40,6 +40,7 @@ jobs:
           set -o pipefail
           bash scripts/build-app.sh 2>&1 | tee validation/package.log
           build/PresenceAgent.app/Contents/MacOS/PresenceAgent --self-test | tee -a validation/package.log
+          bash scripts/test-agent-options.sh | tee -a validation/package.log
       - name: Typecheck integration example
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: |

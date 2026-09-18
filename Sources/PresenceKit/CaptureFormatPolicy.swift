@@ -36,7 +36,7 @@ enum CaptureFormatPolicy {
             }
         }
         guard let best else {
-            throw PresenceError.cameraUnavailable("No format fits the resolution/FPS caps; raise them explicitly only after evaluating power")
+            throw PresenceError.cameraConfigurationUnsupported("No format fits the resolution/FPS caps; raise them explicitly only after evaluating power")
         }
         return best.choice
     }
@@ -54,7 +54,7 @@ enum CaptureFormatPolicy {
               minimumFrameDuration.isFinite, maximumFrameDuration.isFinite,
               minimumFrameDuration > 0, maximumFrameDuration >= minimumFrameDuration,
               1 / minimumFrameDuration <= settings.maximumFPS + 0.01 else {
-            throw PresenceError.cameraUnavailable("Camera configuration exceeds the resolution/FPS caps or reports invalid frame durations")
+            throw PresenceError.cameraConfigurationUnsupported("Camera configuration exceeds the resolution/FPS caps or reports invalid frame durations")
         }
     }
 }

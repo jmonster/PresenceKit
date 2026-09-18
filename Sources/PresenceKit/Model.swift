@@ -27,6 +27,7 @@ public enum PresenceError: Error, Sendable, Equatable, CustomStringConvertible {
     case alreadyRunning
     case cameraPermissionDenied
     case cameraUnavailable(String)
+    case cameraConfigurationUnsupported(String)
     case sensorStalled
     case startupTimedOut
     case sourceEnded
@@ -38,6 +39,7 @@ public enum PresenceError: Error, Sendable, Equatable, CustomStringConvertible {
         case .alreadyRunning: "This monitor/source already has a running session"
         case .cameraPermissionDenied: "Camera access denied; check the host app's camera permission and usage description"
         case .cameraUnavailable(let message): "Camera unavailable: \(message)"
+        case .cameraConfigurationUnsupported(let message): "Unsupported camera configuration: \(message)"
         case .sensorStalled: "No fresh camera frames arrived within sensorTimeout"
         case .startupTimedOut: "Camera startup exceeded startupTimeout"
         case .sourceEnded: "The presence source ended unexpectedly"

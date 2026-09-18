@@ -1,4 +1,5 @@
 import PresenceKit
+import PresencePlayback
 #if os(macOS)
 import AVFoundation
 #endif
@@ -49,6 +50,28 @@ struct PackageClient {
         guard states == [.unknown, .present, .unknown], await monitor.currentState == .unknown else {
             throw PresenceError.cameraUnavailable("External client received unexpected callback sequence: \(states)")
         }
-        print("External package client passed: import, link, MainActor callbacks, teardown")
+        let controlledSource = SmokeSource()
+        var retry = PresenceRetryPolicy(); retry.maximumRetries = 0
+        let automation = try PresenceAutomation(source: controlledSource, configuration: config, retry: retry)
+        var controlledStates: [PresenceState] = []
+        let handler: @MainActor @Sendable (PresenceAutomationEvent) async -> Void = { event in
+            if case .recovery(.monitoring) = event { await controlledSource.sendPresence() }
+            if case .activityChanged(let state) = event {
+                controlledStates.append(state)
+                if state == .present { await controlledSource.close() }
+            }
+        }
+        do {
+            #if os(macOS)
+            let controller = try PresencePlayerController(player: AVPlayer(), automation: automation)
+            try await controller.run(onEvent: handler)
+            #else
+            try await automation.run(onEvent: handler)
+            #endif
+        } catch PresenceError.sourceEnded { }
+        guard controlledStates == [.unknown, .present, .unknown] else {
+            throw PresenceError.invalidConfiguration("Unexpected automation events: \(controlledStates)")
+        }
+        print("External package client passed: sensing, automation, native player controller, ordered callbacks and teardown")
     }
 }

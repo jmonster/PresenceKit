@@ -164,12 +164,12 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         s.beginConfiguration()
         do {
             let input = try AVCaptureDeviceInput(device: device)
-            guard s.canAddInput(input) else { throw PresenceError.cameraUnavailable("Cannot add camera input") }
+            guard s.canAddInput(input) else { throw PresenceError.cameraConfigurationUnsupported("Cannot add camera input") }
             // Do not set a session preset. Input-priority is unavailable on
             // macOS; a quality preset can also undo our explicit device format.
             s.addInput(input)
             let out = AVCaptureVideoDataOutput()
-            guard s.canAddOutput(out) else { throw PresenceError.cameraUnavailable("Cannot add video output") }
+            guard s.canAddOutput(out) else { throw PresenceError.cameraConfigurationUnsupported("Cannot add video output") }
             s.addOutput(out); output = out
             out.alwaysDiscardsLateVideoFrames = true
             out.setSampleBufferDelegate(self, queue: queue)
@@ -178,11 +178,11 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         // Finalize the graph BEFORE applying the device format and rate. Do not
         // assign a preset or reconfigure the graph after these explicit settings.
         try selectFormat(device)
-        guard let out = output else { throw PresenceError.cameraUnavailable("Missing video output") }
+        guard let out = output else { throw PresenceError.cameraConfigurationUnsupported("Missing video output") }
         let formats: [OSType] = [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_32BGRA]
         guard let pixelFormat = formats.first(where: { out.availableVideoPixelFormatTypes.contains($0) }) else {
-            throw PresenceError.cameraUnavailable("No supported luminance/BGRA output")
+            throw PresenceError.cameraConfigurationUnsupported("No supported luminance/BGRA output")
         }
         out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: pixelFormat)]
         try verifyDeviceConfiguration(device)
@@ -230,7 +230,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         guard duration.isNumeric, CMTimeGetSeconds(duration) > 0,
               CMTimeCompare(duration, range.minFrameDuration) >= 0,
               CMTimeCompare(duration, range.maxFrameDuration) <= 0 else {
-            throw PresenceError.cameraUnavailable("Camera advertised inconsistent frame-rate metadata")
+            throw PresenceError.cameraConfigurationUnsupported("Camera advertised inconsistent frame-rate metadata")
         }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
