@@ -11,3 +11,5 @@ cp packaging/Info.plist "$APP/Contents/Info.plist"
 codesign --force --options runtime --entitlements packaging/Entitlements.plist \
   --sign "${SIGNING_IDENTITY:--}" "$APP"
 printf 'Built %s\n' "$APP"
+codesign --verify --strict --verbose=2 "$APP"
+/usr/bin/plutil -lint "$APP/Contents/Info.plist"

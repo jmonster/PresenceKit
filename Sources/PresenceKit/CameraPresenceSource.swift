@@ -45,6 +45,8 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
     private var recognitionDeadline: ContinuousClock.Instant?
     private var nextHeartbeat = ContinuousClock.now
     private var session: AVCaptureSession?
+    private var device: AVCaptureDevice?
+    private var nextFormatCheck = ContinuousClock.now
     private var output: AVCaptureVideoDataOutput?
     private var continuation: AsyncThrowingStream<PresenceSample, Error>.Continuation?
     private var errorObserver: NSObjectProtocol?
@@ -152,9 +154,10 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         dispatchPrecondition(condition: .onQueue(queue))
         let device: AVCaptureDevice?
         if let id = config.camera.uniqueID {
-            device = AVCaptureDevice.devices(for: .video).first { $0.uniqueID == id }
+            device = AVCaptureDevice(uniqueID: id)
         } else { device = AVCaptureDevice.default(for: .video) }
         guard let device else { throw PresenceError.cameraUnavailable("No matching video device") }
+        self.device = device
         let s = AVCaptureSession()
         // Store early so failures have an owned session to unwind.
         session = s
@@ -162,21 +165,27 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         do {
             let input = try AVCaptureDeviceInput(device: device)
             guard s.canAddInput(input) else { throw PresenceError.cameraUnavailable("Cannot add camera input") }
-            s.addInput(input); s.sessionPreset = .inputPriority
+            // Do not set a session preset. Input-priority is unavailable on
+            // macOS; a quality preset can also undo our explicit device format.
+            s.addInput(input)
             let out = AVCaptureVideoDataOutput()
             guard s.canAddOutput(out) else { throw PresenceError.cameraUnavailable("Cannot add video output") }
             s.addOutput(out); output = out
-            let formats: [OSType] = [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_32BGRA]
-            guard let pixelFormat = formats.first(where: { out.availableVideoPixelFormatTypes.contains($0) }) else {
-                throw PresenceError.cameraUnavailable("No supported luminance/BGRA output")
-            }
-            out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: pixelFormat)]
             out.alwaysDiscardsLateVideoFrames = true
             out.setSampleBufferDelegate(self, queue: queue)
-            try selectFormat(device)
             s.commitConfiguration()
         } catch { s.commitConfiguration(); throw error }
+        // Finalize the graph BEFORE applying the device format and rate. Do not
+        // assign a preset or reconfigure the graph after these explicit settings.
+        try selectFormat(device)
+        guard let out = output else { throw PresenceError.cameraUnavailable("Missing video output") }
+        let formats: [OSType] = [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_32BGRA]
+        guard let pixelFormat = formats.first(where: { out.availableVideoPixelFormatTypes.contains($0) }) else {
+            throw PresenceError.cameraUnavailable("No supported luminance/BGRA output")
+        }
+        out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: pixelFormat)]
+        try verifyDeviceConfiguration(device)
         generation += 1; semantic = nil; motion.reset(); visionBusy = false
         motionGate = WorkGate(minimumInterval: config.camera.sampleInterval, maximumDutyCycle: config.motion.maximumDutyCycle)
         visionGate = WorkGate(minimumInterval: config.vision.minimumInterval, maximumDutyCycle: config.vision.maximumDutyCycle)
@@ -186,7 +195,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         let now = clock.now
         readyAt = now.advanced(by: config.camera.warmup); suppressUntil = readyAt
         analyzedAt = nil; motionAt = nil; lightMeasuredAt = nil; lightReading = nil
-        nextHeartbeat = now; nextLightPoll = now
+        nextHeartbeat = now; nextLightPoll = now; nextFormatCheck = now
         recognitionDeadline = visionDisabled ? nil : readyAt.advanced(by: config.vision.maximumInferenceDuration + config.sensorTimeout)
         errorObserver = NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: s, queue: nil) { [weak self] note in
             let message = String(describing: note.userInfo?[AVCaptureSessionErrorKey] ?? "capture runtime error")
@@ -196,43 +205,63 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         }
         s.startRunning() // Blocking legacy API; never blocks MainActor or the cooperative pool.
         guard s.isRunning else { throw PresenceError.cameraUnavailable("Capture session failed to start") }
-        let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-        stats.configuredWidth = Int(dimensions.width); stats.configuredHeight = Int(dimensions.height)
-        stats.configuredFPS = 1 / CMTimeGetSeconds(device.activeVideoMinFrameDuration)
-        guard stats.configuredWidth <= config.camera.maximumWidth,
-              stats.configuredHeight <= config.camera.maximumHeight,
-              stats.configuredFPS <= config.camera.maximumFPS + 0.01 else {
-            throw PresenceError.cameraUnavailable("Driver did not honor the configured format/rate caps")
-        }
+        try verifyDeviceConfiguration(device)
     }
 
     private func selectFormat(_ device: AVCaptureDevice) throws {
-        var best: (format: AVCaptureDevice.Format, duration: CMTime, score: Double)?
+        // Keep native CMTime endpoints alongside the portable selection metadata.
+        // No guessed FPS is assigned to a format that does not advertise it.
+        var native: [(AVCaptureDevice.Format, AVFrameRateRange)] = []
+        var modes: [CaptureMode] = []
         for format in device.formats {
             let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            guard d.width > 0 && d.height > 0 && d.width <= config.camera.maximumWidth && d.height <= config.camera.maximumHeight else { continue }
-            for range in format.videoSupportedFrameRateRanges where range.minFrameRate > 0 {
-                let fps = min(range.maxFrameRate, max(range.minFrameRate, config.camera.requestedFPS))
-                guard fps <= config.camera.maximumFPS else { continue }
-                let score = abs(log(Double(d.width) / Double(config.camera.maximumWidth)))
-                          + abs(log(Double(d.height) / Double(config.camera.maximumHeight)))
-                          + abs(log(fps / config.camera.requestedFPS))
-                let duration: CMTime
-                if fps <= range.minFrameRate { duration = range.maxFrameDuration }
-                else if fps >= range.maxFrameRate { duration = range.minFrameDuration }
-                else { duration = CMTime(seconds: 1 / fps, preferredTimescale: 600_000) }
-                if best == nil || score < best!.score { best = (format, duration, score) }
+            for range in format.videoSupportedFrameRateRanges {
+                native.append((format, range))
+                modes.append(CaptureMode(width: Int(d.width), height: Int(d.height),
+                    minimumFPS: range.minFrameRate, maximumFPS: range.maxFrameRate))
             }
         }
-        guard let best else { throw PresenceError.cameraUnavailable("No format fits the resolution/FPS caps; explicitly raise them after measuring power") }
+        let choice = try CaptureFormatPolicy.choose(from: modes, settings: config.camera)
+        let (format, range) = native[choice.index]
+        let duration: CMTime
+        if choice.fps <= range.minFrameRate { duration = range.maxFrameDuration }
+        else if choice.fps >= range.maxFrameRate { duration = range.minFrameDuration }
+        else { duration = CMTime(seconds: 1 / choice.fps, preferredTimescale: 600_000) }
+        guard duration.isNumeric, CMTimeGetSeconds(duration) > 0,
+              CMTimeCompare(duration, range.minFrameDuration) >= 0,
+              CMTimeCompare(duration, range.maxFrameDuration) <= 0 else {
+            throw PresenceError.cameraUnavailable("Camera advertised inconsistent frame-rate metadata")
+        }
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
-        device.activeFormat = best.format
-        if CMTimeCompare(best.duration, device.activeVideoMaxFrameDuration) > 0 {
-            device.activeVideoMaxFrameDuration = best.duration; device.activeVideoMinFrameDuration = best.duration
+        device.activeFormat = format
+        // Change the outer bound first when lengthening durations so the interim
+        // min/max pair is never inverted. Shortening uses the opposite order.
+        if CMTimeCompare(duration, device.activeVideoMaxFrameDuration) > 0 {
+            device.activeVideoMaxFrameDuration = duration
+            device.activeVideoMinFrameDuration = duration
         } else {
-            device.activeVideoMinFrameDuration = best.duration; device.activeVideoMaxFrameDuration = best.duration
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
         }
+    }
+
+    private func verifyDeviceConfiguration(_ device: AVCaptureDevice) throws {
+        let d = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        let minimum = CMTimeGetSeconds(device.activeVideoMinFrameDuration)
+        let maximum = CMTimeGetSeconds(device.activeVideoMaxFrameDuration)
+        try CaptureFormatPolicy.validate(width: Int(d.width), height: Int(d.height),
+            minimumFrameDuration: minimum, maximumFrameDuration: maximum, settings: config.camera)
+        stats.configuredWidth = Int(d.width); stats.configuredHeight = Int(d.height)
+        stats.configuredFPS = 1 / minimum
+    }
+
+    private func failCapture(_ error: any Error) {
+        // Stop accepting observations immediately. The monitor owns the lease and
+        // will perform ordered teardown after publishing its terminal state.
+        output?.setSampleBufferDelegate(nil, queue: nil)
+        continuation?.finish(throwing: error)
+        continuation = nil
     }
 
     private func stopSession() {
@@ -241,7 +270,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         if let errorObserver { NotificationCenter.default.removeObserver(errorObserver) }
         errorObserver = nil
         output?.setSampleBufferDelegate(nil, queue: nil)
-        session?.stopRunning(); output = nil; session = nil
+        session?.stopRunning(); output = nil; session = nil; device = nil
         continuation?.finish(); continuation = nil
         legacyLight.close(); legacyValue = nil; semantic = nil
     }
@@ -250,6 +279,19 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         dispatchPrecondition(condition: .onQueue(queue))
         guard continuation != nil, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let now = clock.now
+        // Check delivered dimensions on EVERY frame, before sampling or copying.
+        guard CaptureFormatPolicy.dimensionsFit(width: CVPixelBufferGetWidth(buffer),
+            height: CVPixelBufferGetHeight(buffer), settings: config.camera) else {
+            failCapture(PresenceError.cameraUnavailable("Delivered frame exceeds the configured resolution caps"))
+            return
+        }
+        // Recheck readback cheaply once per second to catch another client/driver
+        // changing the shared device after startup. No per-frame device polling.
+        if now >= nextFormatCheck, let device {
+            nextFormatCheck = now.advanced(by: .seconds(1))
+            do { try verifyDeviceConfiguration(device) }
+            catch { failCapture(error); return }
+        }
         var analyzed = false
         if motionGate.isDue(at: now) {
             if let grid = sampleLuminance(buffer, settings: config.camera) {

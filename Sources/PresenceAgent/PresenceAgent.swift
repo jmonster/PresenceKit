@@ -8,6 +8,18 @@ import os
 @MainActor
 struct PresenceAgentMain {
     static func main() {
+        // CI smoke path: validate public API linkage without a camera, consent
+        // prompt, NSApplication event loop, display assertions, or media playback.
+        if CommandLine.arguments.contains("--self-test") {
+            do {
+                _ = try PresenceMonitor.camera()
+                print("PresenceAgent self-test passed (no camera opened)")
+            } catch {
+                print("PresenceAgent self-test failed: \(error)")
+                exit(1)
+            }
+            return
+        }
         let app = NSApplication.shared
         let delegate = AgentDelegate()
         app.delegate = delegate

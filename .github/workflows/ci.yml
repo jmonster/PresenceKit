@@ -1,30 +1,61 @@
 name: Swift
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: swift-${{ github.ref }}
+  group: swift-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   macos:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15-intel, macos-15]
+        runner: [macos-26-intel, macos-26]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
     steps:
       - uses: actions/checkout@v4
-      - run: swift --version
-      - run: swift test
-      - run: swift test -c release
-      - run: bash scripts/build-app.sh
+        id: checkout
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          mkdir -p validation
+          swift --version | tee validation/toolchain.txt
+          xcodebuild -version | tee -a validation/toolchain.txt
+      - name: Debug tests
+        run: set -o pipefail; swift test 2>&1 | tee validation/debug.log
+      - name: Release tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift test -c release 2>&1 | tee validation/release.log
+      - name: Package and verify application
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          bash scripts/build-app.sh 2>&1 | tee validation/package.log
+          build/PresenceAgent.app/Contents/MacOS/PresenceAgent --self-test | tee -a validation/package.log
       - name: Typecheck integration example
-        run: swiftc -swift-version 6 -typecheck -target "$(uname -m)-apple-macosx13.0" -I "$(swift build --show-bin-path)/Modules" Examples/PlayerPresence.swift
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          swiftc -swift-version 6 -typecheck -target "$(uname -m)-apple-macosx13.0" \
+            -I "$(swift build --show-bin-path)/Modules" Examples/PlayerPresence.swift 2>&1 | tee validation/example.log
+      - name: External package consumer
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift run --package-path Examples/PackageClient -c release PackageClient 2>&1 | tee validation/client.log
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ matrix.runner }}
+          path: validation/
+          retention-days: 14
   linux:
     runs-on: ubuntu-latest
     strategy:
@@ -35,5 +66,37 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: bash scripts/test-release.sh
       - run: swift test
       - run: swift test -c release
+      - run: swift run --package-path Examples/PackageClient -c release PackageClient
+  required:
+    name: Release gate
+    if: ${{ always() }}
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform to pass
+        env:
+          MACOS_RESULT: ${{ needs.macos.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+        run: |
+          test "$MACOS_RESULT" = success
+          test "$LINUX_RESULT" = success
+  prerelease:
+    name: Publish versioned beta
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: required
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Publish only the fully tested main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/publish-prerelease.sh
