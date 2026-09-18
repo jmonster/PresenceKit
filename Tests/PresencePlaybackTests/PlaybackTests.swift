@@ -31,6 +31,7 @@ private final class OutputSpy: PlaybackOutput {
     var trace: [String] = []
     var beginError = false
     var wakeError = false
+    var cancelOnWake = false
     var delaySuppression = false
     var suppression: CheckedContinuation<Void, Never>?
     var report: (@MainActor (PresencePlaybackError) -> Void)?
@@ -42,7 +43,11 @@ private final class OutputSpy: PlaybackOutput {
         trace.append("suppress")
         if delaySuppression { await withCheckedContinuation { suppression = $0 } }
     }
-    func wake() throws { trace.append("wake"); if wakeError { throw PresencePlaybackError.power("wake failed") } }
+    func wake() throws {
+        trace.append("wake")
+        if cancelOnWake { withUnsafeCurrentTask { $0?.cancel() } }
+        if wakeError { throw PresencePlaybackError.power("wake failed") }
+    }
     func setPlaying(_ playing: Bool) { trace.append(playing ? "play" : "pause") }
     func sleep() async throws { trace.append("sleep") }
     func releaseDisplay() { trace.append("release") }
@@ -122,6 +127,20 @@ final class PlaybackTests: XCTestCase {
         XCTAssertFalse(spy.trace.contains("end"))
         await source.resumeCleanup(); _ = await task.result
         XCTAssertEqual(spy.trace.last, "end")
+    }
+    func testCancellationDuringWakeCannotStartPlayback() async throws {
+        let source = OutputSource(), spy = OutputSpy(), coordinator = PlaybackCoordinator(output: spy)
+        spy.cancelOnWake = true
+        let a = try automation(source)
+        let task = Task {
+            try await coordinator.run(automation: a) { event in
+                if case .recovery(.monitoring) = event { await source.send() }
+            }
+        }
+        try await eventually { spy.trace.contains("wake") }
+        // The spy cancels the callback task during wake; terminate the owner too.
+        task.cancel(); _ = await task.result
+        XCTAssertFalse(spy.trace.contains("play")); XCTAssertEqual(spy.trace.last, "end")
     }
     func testCancelDuringSuppressionCannotWakeOrPlayLater() async throws {
         let source = OutputSource(), spy = OutputSpy(), coordinator = PlaybackCoordinator(output: spy)

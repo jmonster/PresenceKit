@@ -88,6 +88,9 @@ final class PlaybackCoordinator {
                 guard generation == id, fault == nil else { return }
                 try Task.checkCancellation()
                 try output.wake()
+                // Cancellation may arrive during the synchronous OS wake call.
+                try Task.checkCancellation()
+                guard generation == id, fault == nil else { return }
                 output.setPlaying(true)
             case .absent:
                 output.setPlaying(false)

@@ -42,6 +42,10 @@ struct AgentOptions {
         guard !(human && face) else { throw PresenceError.invalidConfiguration("Choose --human OR --face") }
         if human { configuration.vision.mode = .humanRectangles }
         if face { configuration.vision.mode = .faceRectangles }
+        // Validate before Duration conversion; a finite Double can still overflow.
+        if let absence, !(1...86_400).contains(absence) {
+            throw PresenceError.invalidConfiguration("Absence delay must be 1...86400 seconds")
+        }
         configuration.absenceDelay = .seconds(absence ?? (human || face ? 240 : 120))
         guard (0...3600).contains(grace) else { throw PresenceError.invalidConfiguration("Fallback grace must be 0...3600 seconds") }
         switch fallbackName {

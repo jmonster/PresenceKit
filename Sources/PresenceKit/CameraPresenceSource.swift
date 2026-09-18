@@ -101,7 +101,11 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
             return PresenceSession(samples: stream) { [self] in await close(lease: id) }
         } catch {
             await close(lease: id)
-            throw error
+            // AVFoundation input/lock failures are transport failures. Keep
+            // explicit configuration/permission/cancellation errors unchanged.
+            if error is CancellationError { throw error }
+            if let typed = error as? PresenceError { throw typed }
+            throw PresenceError.cameraUnavailable(String(describing: error))
         }
     }
 
