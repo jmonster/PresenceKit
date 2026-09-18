@@ -1,6 +1,7 @@
 import Foundation
 
 public struct PresenceConfiguration: Sendable {
+    public var startupTimeout: Duration = .seconds(60)
     public var absenceDelay: Duration = .seconds(120)
     public var sensorTimeout: Duration = .seconds(8)
     public var watchdogInterval: Duration = .seconds(1)
@@ -23,6 +24,7 @@ public struct PresenceConfiguration: Sendable {
         func finite(_ value: Double, in range: ClosedRange<Double>) -> Bool {
             value.isFinite && range.contains(value)
         }
+        try require(startupTimeout >= .seconds(1) && startupTimeout <= .seconds(300), "startupTimeout must be 1...300 seconds")
         try require(absenceDelay >= .seconds(1) && absenceDelay <= .seconds(86_400), "absenceDelay must be 1 second...1 day")
         try require(sensorTimeout > camera.sampleInterval * 2 && sensorTimeout <= .seconds(120), "sensorTimeout must exceed two sample intervals and be <= 120 seconds")
         try require(watchdogInterval >= .milliseconds(100) && watchdogInterval < sensorTimeout, "watchdogInterval must be >= 100 ms and < sensorTimeout")
@@ -43,7 +45,13 @@ public struct PresenceConfiguration: Sendable {
         try require(finite(vision.maximumDutyCycle, in: 0.001...0.25) && vision.maximumInferenceDuration > .zero && vision.maximumInferenceDuration <= .seconds(10), "invalid Vision budget")
         try require(finite(vision.minimumConfidence, in: 0...1) && finite(vision.minimumArea, in: 0...1), "invalid Vision acceptance thresholds")
         if vision.mode != .disabled {
-            try require(absenceDelay >= vision.minimumInterval * 2, "absenceDelay must cover at least two nominal Vision intervals")
+            try require(vision.maximumInferenceDuration < sensorTimeout,
+                        "Vision duration budget must be less than sensorTimeout")
+            let worstInterval = max(vision.minimumInterval,
+                .seconds(vision.maximumInferenceDuration.secondsValue / vision.maximumDutyCycle))
+            let required = worstInterval * 2 + sensorTimeout
+            try require(absenceDelay >= required,
+                        "absenceDelay must be at least \(required.secondsValue) seconds for two budgeted Vision opportunities; increase it or reduce the inference budget")
         }
         try require(finite(light.cameraDarkBelow, in: 0...1) && finite(light.cameraBrightAbove, in: 0...1) && light.cameraDarkBelow < light.cameraBrightAbove, "invalid camera light thresholds")
         try require(light.dwell >= .zero && light.dwell <= .seconds(300), "invalid light dwell")

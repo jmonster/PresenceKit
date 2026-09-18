@@ -6,11 +6,13 @@ The acceptance criterion is lower **total system energy for the actual workload*
 
 Motion defaults to a 96 x 72 luminance grid, two samples per second, no model inference, and an actual configured camera rate requested at 5 fps. The source refuses resolutions above 640 x 480 and rates above 10 fps by default. Unsupported low-rate hardware fails explicitly instead of silently running a higher-cost profile.
 
-For measured work duration `d` and duty target `b`, the next admission is no earlier than `completion + d * (1/b - 1)`, also respecting the minimum interval. There are no catch-up bursts. Motion defaults to b = 0.02; optional Vision defaults to b = 0.01. These are separate measured wall-time schedules, not combined CPU percentages. Parallel execution inside frameworks, GPU/Neural Engine activity, camera capture, copying overhead outside inference, and host work are not all represented by those figures.
+For measured work duration `d` and duty target `b`, the next admission is no earlier than `completion + d * (1/b - 1)`, also respecting the minimum interval. There are no catch-up bursts. Motion defaults to b = 0.02; optional Vision defaults to b = 0.01. These are separate measured wall-time schedules, not combined CPU percentages. Parallel execution inside frameworks, GPU/Neural Engine activity, camera capture, and host work are not all represented by those figures.
 
 A 200 ms inference at a 1% duty target yields about a 20 second start-to-start interval, even when the configured minimum interval is 10 seconds. Recognition responsiveness degrades rather than consuming unlimited compute. An inference that takes more than the configured completed-duration ceiling disables future Vision work for that run. A request already running is not preempted. Thermal pressure also suppresses new requests.
 
-Motion still runs when Vision is disabled. If motion budget throttling or a failing camera prevents fresh samples for the sensor timeout, the monitor becomes unknown and stops capture. The host can fail visibly or retry with backoff.
+Motion still runs when Vision is disabled, with typed fallback notification. The camera emits inexpensive delivery heartbeats even while its analysis gate is closed. Stale analysis becomes unknown without stopping a delivering camera; actual frame-delivery silence stops the run. Extremely low budgets can therefore make the detector uninformative rather than spuriously classifying the camera as broken.
+
+Recognition configuration must reserve two worst-case budgeted opportunities plus sensorTimeout before absence. An enabled recognizer that misses its advertised result deadline emits cadenceExceeded, and an expired absence decision becomes unknown. These safeguards do not assert presence indefinitely or turn skipped observations into new evidence. Measured Vision duration includes its frame copy and queue delay.
 
 ## Measure the real system
 

@@ -13,6 +13,7 @@ final class PlayerPresence {
         config.absenceDelay = .seconds(120)
         // Opt in only after testing on the target Mac:
         // config.vision.mode = .humanRectangles
+        // config.absenceDelay = .seconds(240)
         monitor = try PresenceMonitor.camera(configuration: config)
     }
 
@@ -20,6 +21,9 @@ final class PlayerPresence {
         let player = player
         do {
             try await monitor.run { @MainActor event in
+                if case .statusChanged(let status) = event {
+                    print("PresenceKit operational status: \(status)")
+                }
                 guard case .presenceChanged(let change) = event else { return }
                 switch change.current {
                 case .present: player.play()

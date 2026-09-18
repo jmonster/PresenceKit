@@ -1,15 +1,24 @@
 import Foundation
 
-/// Deterministic state machine; all time comes from the caller. Owned by one actor.
+/// Deterministic state machine; all timestamps come from the caller. Camera
+/// delivery, usable analysis, and positive evidence have independent clocks.
 struct PresenceReducer: Sendable {
     let config: PresenceConfiguration
     private(set) var presence: PresenceState = .unknown
     private(set) var lighting: LightingState = .unknown
     private(set) var lastFrame: ContinuousClock.Instant?
+    private(set) var lastAnalysis: ContinuousClock.Instant?
     private var began: ContinuousClock.Instant?
     private var lastEvidence: ContinuousClock.Instant?
+    private var lastMotion: ContinuousClock.Instant?
     private var lastSemantic: ContinuousClock.Instant?
+    private var lastLightMeasurement: ContinuousClock.Instant?
     private var hits: [ContinuousClock.Instant] = []
+    private var rawAnalysis: AnalysisStatus = .warmingUp
+    private var rawRecognition: RecognitionStatus = .disabled
+    private var recognitionDeadline: ContinuousClock.Instant?
+    private var publishedAnalysis: AnalysisStatus?
+    private var publishedRecognition: RecognitionStatus?
     private var lightSource: LightReading.Source?
     private var lightCandidate: LightingState?
     private var lightCandidateSince: ContinuousClock.Instant?
@@ -25,24 +34,40 @@ struct PresenceReducer: Sendable {
             events += invalidate(at: now, reason: .sensorUnavailable)
         }
         lastFrame = sample.capturedAt
-        if began == nil { began = sample.capturedAt }
-        let entryWindow = config.entryWindow
-        hits.removeAll { $0.duration(to: sample.capturedAt) > entryWindow }
-        if sample.motion {
+        rawAnalysis = sample.analysisStatus
+        rawRecognition = sample.recognitionStatus
+        recognitionDeadline = sample.recognitionDeadline
+
+        if let analyzed = sample.analyzedAt,
+           analyzed <= sample.capturedAt, analyzed.duration(to: now) < config.sensorTimeout,
+           lastAnalysis.map({ analyzed > $0 }) ?? true {
+            if let last = lastAnalysis, last.duration(to: analyzed) >= config.sensorTimeout {
+                events += forgetEvidence(at: now, reason: .analysisUnavailable)
+            }
+            lastAnalysis = analyzed
+            if began == nil { began = analyzed }
+        }
+        // A cached positive result counts exactly once. Heartbeats cannot turn one
+        // motion hit into two confirmations or refresh the absence countdown.
+        if let at = sample.motionAt, let analyzed = lastAnalysis, let began,
+           at >= began, at <= analyzed, at.duration(to: now) < config.sensorTimeout,
+           lastMotion.map({ at > $0 }) ?? true {
+            lastMotion = at
+            let window = config.entryWindow
+            hits.removeAll { $0.duration(to: at) > window }
             if presence == .present {
-                lastEvidence = sample.capturedAt
+                lastEvidence = max(lastEvidence ?? at, at)
             } else {
-                hits.append(sample.capturedAt)
+                hits.append(at)
                 if hits.count >= config.entryConfirmationCount {
-                    lastEvidence = sample.capturedAt
+                    lastEvidence = at
                     events += transition(to: .present, reason: .motion, at: now)
                     hits.removeAll(keepingCapacity: true)
                 }
             }
         }
-        if let evidence = sample.semantic,
-           evidence.capturedAt <= sample.capturedAt,
-           evidence.capturedAt >= (began ?? sample.capturedAt),
+        if let evidence = sample.semantic, let began,
+           evidence.capturedAt <= sample.capturedAt, evidence.capturedAt >= began,
            evidence.capturedAt.duration(to: now) < config.sensorTimeout,
            lastSemantic.map({ evidence.capturedAt > $0 }) ?? true {
             lastSemantic = evidence.capturedAt
@@ -55,7 +80,12 @@ struct PresenceReducer: Sendable {
             events += transition(to: .present, reason: reason, at: now)
         }
         events += tick(at: now)
-        if config.light.enabled { events += updateLight(sample.light, at: sample.capturedAt) }
+        if config.light.enabled, let measured = sample.lightMeasuredAt,
+           measured <= sample.capturedAt, measured.duration(to: now) < config.sensorTimeout,
+           lastLightMeasurement.map({ measured > $0 }) ?? true {
+            lastLightMeasurement = measured
+            events += updateLight(sample.light, at: measured)
+        }
         return events
     }
 
@@ -63,15 +93,41 @@ struct PresenceReducer: Sendable {
         guard let lastFrame, lastFrame.duration(to: now) < config.sensorTimeout else {
             return invalidate(at: now, reason: .sensorUnavailable)
         }
-        if let reference = lastEvidence ?? began, reference.duration(to: now) >= config.absenceDelay {
-            return transition(to: .absent, reason: .inactivity, at: now)
+        var events: [PresenceEvent] = []
+        let fresh = lastAnalysis.map { $0.duration(to: now) < config.sensorTimeout } ?? false
+        let analysis: AnalysisStatus = fresh ? rawAnalysis : (rawAnalysis == .warmingUp ? .warmingUp : .stale)
+        if analysis != publishedAnalysis {
+            publishedAnalysis = analysis; events.append(.statusChanged(.analysis(analysis)))
         }
-        return []
+        let overdue = rawRecognition == .active && recognitionDeadline.map { now >= $0 } == true
+        let recognition: RecognitionStatus = overdue ? .cadenceExceeded : rawRecognition
+        if recognition != publishedRecognition {
+            publishedRecognition = recognition; events.append(.statusChanged(.recognition(recognition)))
+        }
+        guard fresh else {
+            return events + forgetEvidence(at: now, reason: .analysisUnavailable)
+        }
+        if let reference = lastEvidence ?? began, reference.duration(to: now) >= config.absenceDelay {
+            // No silent departure while an enabled recognizer has missed its
+            // advertised result deadline. Explicitly failed/paused recognition is
+            // a typed motion-only fallback, rather than an unannounced one.
+            events += transition(to: overdue ? .unknown : .absent,
+                                 reason: overdue ? .recognitionUnavailable : .inactivity, at: now)
+        }
+        return events
     }
 
     mutating func invalidate(at now: ContinuousClock.Instant, reason: PresenceReason) -> [PresenceEvent] {
+        let events = forgetEvidence(at: now, reason: reason)
+        lastFrame = nil; lastAnalysis = nil
+        return events
+    }
+
+    private mutating func forgetEvidence(at now: ContinuousClock.Instant, reason: PresenceReason) -> [PresenceEvent] {
         let events = transition(to: .unknown, reason: reason, at: now)
-        lastFrame = nil; began = nil; lastEvidence = nil; lastSemantic = nil; hits.removeAll(keepingCapacity: true)
+        began = nil; lastEvidence = nil; lastSemantic = nil; lastMotion = nil
+        hits.removeAll(keepingCapacity: true)
+        lastLightMeasurement = nil
         lightCandidate = nil; lightCandidateSince = nil; lightSource = nil
         let previous = lighting; lighting = .unknown
         return events + (previous == .unknown ? [] : [.lightingChanged(previous: previous, current: .unknown)])

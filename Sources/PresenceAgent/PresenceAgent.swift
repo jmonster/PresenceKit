@@ -35,6 +35,7 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
         var config = PresenceConfiguration.lowPower
         if args.contains("--human") { config.vision.mode = .humanRectangles }
         if args.contains("--face") { config.vision.mode = .faceRectangles }
+        if config.vision.mode != .disabled { config.absenceDelay = .seconds(240) }
         if args.contains("--cpu-only") { config.vision.compute = .cpuOnly }
         if let i = args.firstIndex(of: "--absence-seconds"), i + 1 < args.count,
            let seconds = Double(args[i + 1]), seconds.isFinite { config.absenceDelay = .seconds(seconds) }
@@ -101,6 +102,8 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
                 let s = await source.statistics()
                 log.info("Camera \(s.configuredWidth)x\(s.configuredHeight) @ \(s.configuredFPS) fps; motion \(s.lastMotionMilliseconds) ms; Vision \(s.visionStatus, privacy: .public), \(s.lastVisionMilliseconds) ms")
             }
+        case .statusChanged(let status):
+            log.info("Sensing status: \(String(describing: status), privacy: .public)")
         case .lightingChanged(_, let current):
             log.info("Lighting: \(current.rawValue, privacy: .public)")
         }
