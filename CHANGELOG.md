@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-beta.1 — macOS build and release validation
+
+- Removed the unavailable macOS capture preset. Native device format and frame durations are selected after graph configuration, with pre/post-start and periodic readback validation.
+- Added per-frame output dimension caps and rejection of malformed driver metadata.
+- Added 11 portable format regressions and 5 native macOS API/NV12 tests (61 portable / 69 native tests total).
+- Added an external SwiftPM consumer, packaged-agent no-camera smoke check, signature validation, and native CI log artifacts.
+- Added a Release gate covering both architectures, and beta publication only from a passing main commit. Publication never moves a tag and has eight network-free safety tests.
+- No source-breaking public API changes relative to the lifecycle-hardening revision.
+
 ## Unreleased — 0.1 lifecycle and budget hardening
 
 Addresses the source audit of revision 19f0367.
