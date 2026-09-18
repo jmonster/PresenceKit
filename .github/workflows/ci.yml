@@ -27,6 +27,7 @@ jobs:
       - name: Toolchain
         run: |
           mkdir -p validation
+          git rev-parse HEAD 'HEAD^{tree}' > validation/source-identity.txt
           swift --version | tee validation/toolchain.txt
           xcodebuild -version | tee -a validation/toolchain.txt
       - name: Debug tests
@@ -65,14 +66,38 @@ jobs:
         swift: ['6.0', '6.2']
     container: swift:${{ matrix.swift }}
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
+        id: checkout
         with:
           persist-credentials: false
-      - run: bash scripts/test-release.sh
-      - run: swift test
-      - run: swift test -c release
-      - run: swift run --package-path Examples/PackageClient -c release PackageClient
+      - name: Retain exact source and toolchain
+        run: |
+          set -o pipefail
+          mkdir -p validation
+          git rev-parse HEAD 'HEAD^{tree}' > validation/source-identity.txt
+          git archive --format=tar HEAD | gzip > validation/source.tar.gz
+          swift --version | tee validation/toolchain.txt
+      - name: Publication safety tests
+        run: set -o pipefail; bash scripts/test-release.sh 2>&1 | tee validation/publication.log
+      - name: Debug tests
+        run: set -o pipefail; swift test 2>&1 | tee validation/debug.log
+      - name: Release tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift test -c release 2>&1 | tee validation/release.log
+      - name: External package consumer
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift run --package-path Examples/PackageClient -c release PackageClient 2>&1 | tee validation/client.log
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-linux-${{ matrix.swift }}
+          path: validation/
+          retention-days: 14
   required:
     name: Release gate
     if: ${{ always() }}
