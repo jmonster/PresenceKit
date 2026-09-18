@@ -6,11 +6,13 @@ private actor FakeSource: PresenceSource {
     var stops = 0
     var failStart = false
     private var output: AsyncThrowingStream<PresenceSample, Error>.Continuation?
-    func start() async throws -> AsyncThrowingStream<PresenceSample, Error> {
+    func start() async throws -> PresenceSession {
+        guard output == nil else { throw PresenceError.alreadyRunning }
         starts += 1
         if failStart { throw PresenceError.cameraUnavailable("test startup failure") }
         let pair = AsyncThrowingStream<PresenceSample, Error>.makeStream()
-        output = pair.continuation; return pair.stream
+        output = pair.continuation
+        return PresenceSession(samples: pair.stream) { await self.stop() }
     }
     func stop() async { stops += 1; output?.finish(); output = nil }
     func send(_ sample: PresenceSample) { output?.yield(sample) }
@@ -75,12 +77,12 @@ final class MonitorTests: XCTestCase {
         let starts = await source.starts, stops = await source.stops
         XCTAssertEqual(starts, 2); XCTAssertEqual(stops, 2)
     }
-    func testStartupFailureUnwindsResources() async throws {
+    func testStartupFailureDoesNotStopAnUnownedSession() async throws {
         let source = FakeSource()
         await source.setStartupFailure()
         let monitor = try PresenceMonitor(source: source, configuration: configuration())
         do { try await monitor.run { _ in }; XCTFail("expected startup failure") } catch {}
-        let stops = await source.stops; XCTAssertEqual(stops, 1)
+        let stops = await source.stops; XCTAssertEqual(stops, 0)
     }
     func testUnexpectedStreamEndStopsMonitoring() async throws {
         let source = FakeSource()
@@ -111,10 +113,10 @@ final class MonitorTests: XCTestCase {
             try await monitor.run { event in
                 await recorder.append(event)
                 // Cancellable suspension simulates slow host work without blocking a thread.
-                try? await Task.sleep(for: .seconds(60))
+                if event == .statusChanged(.running) { try? await Task.sleep(for: .seconds(60)) }
             }
         }
-        try await waitFor { await recorder.events.count == 1 }
+        try await waitFor { await recorder.events.contains(.statusChanged(.running)) }
         let time = ContinuousClock.now.advanced(by: .milliseconds(-100))
         for i in 0..<8 {
             await source.send(.init(capturedAt: time.advanced(by: .milliseconds(i)), motion: false,

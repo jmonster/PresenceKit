@@ -40,11 +40,11 @@ final class CoreTests: XCTestCase {
     }
     func testEntryNeedsTwoHits() {
         var r = PresenceReducer(config: config())
-        XCTAssertTrue(r.ingest(sample(0, motion: true), now: t(0)).isEmpty)
+        XCTAssertTrue(r.ingest(sample(0, motion: true), now: t(0)).observations.isEmpty)
         let events = r.ingest(sample(0.5, motion: true), now: t(0.5))
         XCTAssertEqual(r.presence, .present)
-        XCTAssertEqual(events.count, 1)
-        XCTAssertTrue(r.ingest(sample(1, motion: true), now: t(1)).isEmpty)
+        XCTAssertEqual(events.observations.count, 1)
+        XCTAssertTrue(r.ingest(sample(1, motion: true), now: t(1)).observations.isEmpty)
     }
     func testSingleHitDoesNotPostponeInitialAbsenceForever() {
         var r = PresenceReducer(config: config())
@@ -62,7 +62,7 @@ final class CoreTests: XCTestCase {
     func testNoRepeatedPresenceCallbacks() {
         var r = PresenceReducer(config: config())
         var count = 0
-        for i in 0...20 { count += r.ingest(sample(Double(i) * 0.5, motion: true), now: t(Double(i) * 0.5)).count }
+        for i in 0...20 { count += r.ingest(sample(Double(i) * 0.5, motion: true), now: t(Double(i) * 0.5)).observations.count }
         XCTAssertEqual(count, 1)
     }
     func testAbsenceMeasuredFromLastEvidence() {
@@ -73,7 +73,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(r.presence, .present)
         _ = r.ingest(sample(3.5), now: t(3.5))
         XCTAssertEqual(r.presence, .absent)
-        XCTAssertTrue(r.ingest(sample(4), now: t(4)).isEmpty)
+        XCTAssertTrue(r.ingest(sample(4), now: t(4)).observations.isEmpty)
     }
     func testStaleCameraIsUnknownNotAbsent() {
         var r = PresenceReducer(config: config())
@@ -183,5 +183,11 @@ final class CoreTests: XCTestCase {
         let detector = MotionDetector(width: 32, height: 24, settings: MotionConfiguration())
         _ = detector.measure(Array(repeating: 0.1, count: 768)); detector.reset()
         XCTAssertFalse(detector.measure(Array(repeating: 0.5, count: 768)).detected)
+    }
+}
+
+private extension Array where Element == PresenceEvent {
+    var observations: [PresenceEvent] {
+        filter { if case .statusChanged = $0 { return false }; return true }
     }
 }
