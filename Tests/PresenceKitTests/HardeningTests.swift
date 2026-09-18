@@ -126,14 +126,14 @@ final class HardeningTests: XCTestCase {
         task.cancel(); _ = await task.result
     }
 
-    func testVisionConfigurationRejectsAuditedContradictoryCadence() {
+    func testVisionConfigurationRejectsAuditedContradictoryCadence() async {
         var c = config(); c.vision.mode = .humanRectangles; c.absenceDelay = .seconds(20)
         XCTAssertThrowsError(try c.validate())
         c.absenceDelay = .seconds(240)
         XCTAssertNoThrow(try c.validate())
     }
 
-    func testCompatibleVisionBudgetKeepsStationaryOccupantPresent() throws {
+    func testCompatibleVisionBudgetKeepsStationaryOccupantPresent() async throws {
         var c = config(); c.vision.mode = .humanRectangles
         c.vision.maximumInferenceDuration = .milliseconds(500)
         try c.validate() // 2 * 50s + 8s <= the default 120s grace.
@@ -154,7 +154,7 @@ final class HardeningTests: XCTestCase {
         }
     }
 
-    func testOverdueRecognizerDoesNotProduceSilentDeparture() throws {
+    func testOverdueRecognizerDoesNotProduceSilentDeparture() async throws {
         var c = config(); c.vision.mode = .humanRectangles; c.absenceDelay = .seconds(240)
         try c.validate()
         var r = PresenceReducer(config: c)
@@ -269,7 +269,7 @@ final class HardeningTests: XCTestCase {
         await source.allowCleanup(); await cleanup.value
     }
 
-    func testHeartbeatsDoNotMultiplyMotionConfirmationsOrLightDwell() {
+    func testHeartbeatsDoNotMultiplyMotionConfirmationsOrLightDwell() async {
         var c = config(); c.entryConfirmationCount = 2; c.light.enabled = true; c.light.dwell = .seconds(1)
         let origin = ContinuousClock.now
         var r = PresenceReducer(config: c)
@@ -282,7 +282,7 @@ final class HardeningTests: XCTestCase {
         XCTAssertEqual(r.lighting, .unknown)
     }
 
-    func testRecognitionFallbackIsTypedAndDeduplicated() {
+    func testRecognitionFallbackIsTypedAndDeduplicated() async {
         let origin = ContinuousClock.now
         var r = PresenceReducer(config: config()), events: [PresenceEvent] = []
         for i in 0..<5 {
@@ -343,7 +343,7 @@ final class HardeningTests: XCTestCase {
         XCTAssertEqual(states, [.unknown, .present, .unknown])
     }
 
-    func testRecoveryCannotReplayCachedPreGapEvidence() {
+    func testRecoveryCannotReplayCachedPreGapEvidence() async {
         var c = config(); c.entryConfirmationCount = 2
         var r = PresenceReducer(config: c)
         let t = ContinuousClock.now
