@@ -238,7 +238,8 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         switch AVError.Code(rawValue: value.code) {
         case .deviceWasDisconnected: return .captureFailure(.disconnected)
         case .deviceInUseByAnotherApplication: return .captureFailure(.deviceInUse)
-        case .mediaServicesWereReset: return .captureFailure(.mediaServicesReset)
+        // mediaServicesWereReset is not imported by the macOS SDK. Do not
+        // invent a raw-code mapping for an error without a macOS contract.
         case .applicationIsNotAuthorizedToUseDevice: return .cameraPermissionDenied
         default: return .cameraUnavailable(value.localizedDescription)
         }
