@@ -156,9 +156,9 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
     private func setStatus(_ text: String) {
         statusItem?.title = text; item?.button?.toolTip = text
     }
-    @objc private func restart() { restart(reload: false) }
-    @objc private func reloadMedia() { restart(reload: true) }
-    private func restart(reload: Bool) {
+    @objc private func restart() { scheduleRestart(reload: false) }
+    @objc private func reloadMedia() { scheduleRestart(reload: true) }
+    private func scheduleRestart(reload: Bool) {
         guard restartTask == nil, !terminating else { return }
         let old = task, diagnostics = diagnosticsTask
         task = nil; old?.cancel(); diagnostics?.cancel()
