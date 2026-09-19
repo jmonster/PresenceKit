@@ -1,125 +1,90 @@
 # PresenceKit
 
-**Use a Mac's camera to make media playback respond to people in the room.**
+**Local presence sensing for Swift apps on macOS.**
 
-PresenceKit is a Swift package that looks for motion, optionally adds human or face detection, and reports whether someone appears to be present. You can use those signals in your own application, let the playback library control an `AVPlayer`, or try the included **PresenceAgent** menu-bar app without writing an integration.
+PresenceKit turns camera observations into **presence, lighting, and sensor-status events**. It uses lightweight motion detection, optional on-device human or face detection, and configurable timing to report whether someone appears to be present. Your application decides what to do with that information.
 
-Everything runs locally. Images are not recorded or uploaded, and human/face detection does not identify people. There are no third-party package dependencies.
+Use those events to adapt an interface, suspend expensive work, drive an interactive installation, or feed your own automation system. PresenceKit provides the sensing and lifecycle machinery; your application supplies the behavior.
 
-**Requirements:** macOS 13 or newer, Intel or Apple silicon, a Swift 6 toolchain, and a camera that supports the configured capture limits. This is a source prerelease: build it locally, and expect API changes before 1.0. It is not a notarized end-user download.
+Processing stays on the Mac. Images are not recorded or uploaded, and human/face detection does not identify people. There are no third-party package dependencies.
 
-[Try the player](#try-the-player) · [Use in your app](#use-in-your-app) · [How presence is decided](#how-presence-is-decided) · [Development and project map](#development-and-project-map)
+**Requirements:** Swift 6, macOS 13 or newer, Intel or Apple silicon, and a camera that supports the configured capture limits. This is a source prerelease; APIs may change before 1.0.
 
-## What is included?
+[Quick start](#quick-start) · [What it reports](#what-it-reports) · [Recovery and custom behavior](#recovery-and-custom-behavior) · [Configuration](#configuration) · [Optional playback example](#optional-playback-example) · [Development](#development)
 
-The project separates **sensing**, **decisions**, and **actions**. You can use only the layers you need.
+## What it reports
 
-| Component | What it does | Start here when… |
-| --- | --- | --- |
-| `PresenceKit` | Reads camera input. `PresenceMonitor` emits raw state changes; `PresenceAutomation` adds retries and decides what to do when recognition is unavailable. | You want presence callbacks or your own application behavior. |
-| `PresencePlayback` | Applies those decisions to playback and optional display power control. `PresencePlayerController` is the macOS `AVPlayer` entry point. | You already have a player to integrate. |
-| `PresenceAgent` | A windowed local-media player with a menu-bar status UI, built on the same public controller. | You want to try the project or run a standalone player. |
+PresenceKit separates observations from application behavior. Its core presence states do not imply a particular action:
 
-## Try the player
-
-On a Mac with Swift 6 available, clone this fork and build the app bundle:
-
-```sh
-git clone https://github.com/jmonster/PresenceKit.git
-cd PresenceKit
-bash scripts/build-app.sh
-open build/PresenceAgent.app --args --media "/absolute/path/movie.mp4"
-```
-
-Replace the media path with a readable local movie. The app validates that the media is playable and has a finite duration. Grant camera access when prompted, then move within the camera's view after its three-second warmup. The macOS camera indicator remains visible while capture is active.
-
-With the defaults, accepted motion resumes playback; 120 seconds without accepted evidence pauses it, as long as observations remain fresh. Media **plays once**, not on a loop. Display power settings are unchanged unless you opt in.
-
-Quit the running app before relaunching it with different arguments. Common options are:
-
-| Option | Effect |
+| State | Meaning |
 | --- | --- |
-| `--loop` | Repeat the movie instead of playing it once. |
-| `--manage-display` | Wake the display and keep it on while present; request display sleep when absent. Recent local input defers forced sleep. |
-| `--keep-awake` | Separately prevent idle system sleep while sensing is live and the policy permits it. Explicit user sleep is still allowed. |
-| `--human` or `--face` | Add human-rectangle or face-rectangle detection. Either selects a 240-second default absence delay. |
-| `--absence-seconds N` | Set the absence delay, subject to the sensing configuration's minimum requirements. |
+| `present` | The detector has accepted evidence of presence. |
+| `absent` | No accepted evidence arrived within the configured absence delay, while observations remained fresh. |
+| `unknown` | Sensing is not reliable enough to decide, including during startup or when observations become stale. |
 
-The menu shows sensed state, playback decisions, recovery, and recognition mode. **Show diagnostics** reports capture and processing statistics. **Restart monitoring** keeps the current media; **Reload media and restart** reloads it, including replay after it reaches the end.
+**Unknown is not absent.** Your application should handle it explicitly rather than interpreting a sensor problem as an empty room. Absence is an inference, not proof of physical vacancy.
 
-For login startup, run `bash scripts/install-agent.sh --media "/absolute/path/movie.mp4"` as your normal user, **not with sudo**. Append the same options as above. Remove the login setup with `bash scripts/uninstall-agent.sh`.
+`PresenceMonitor` also reports lighting transitions (`dark`, `bright`, `unknown`) and operational status, including startup, recognition availability, and failures. Camera brightness is a heuristic, not a calibrated lux reading; light changes alone do not establish presence.
 
-See the [unattended operation guide](docs/UNATTENDED.md#launch-a-local-movie) for all launch options, argument validation, and login behavior.
+Presence notifications include the previous state, current state, reason, and timestamp. A run starts with an initial `unknown` notification, then reports state changes rather than periodic “still present” messages.
 
-## How presence is decided
+## Quick start
 
-Motion is the baseline: the camera image is reduced to a small brightness grid and compared over time. After warmup, entry needs two positive samples within two seconds. Optional Apple Vision detection can add evidence for a person who is not moving. It supplements motion; it does not turn the system into a human-only classifier.
+### Add the core library
 
-| State | Meaning | Built-in playback behavior |
-| --- | --- | --- |
-| `present` | The detector has accepted presence evidence. | Show/resume media; optionally wake the display and keep it on. |
-| `absent` | No accepted evidence arrived within the configured absence delay, while observations remained fresh. | Pause/hide media; optionally request display sleep. |
-| `unknown` | Sensing is not reliable enough to decide, including during startup or stale observations. | Pause/hide media and stop keeping the display on; **never force display sleep because observations are missing**. |
-
-Events report **state changes**, not periodic “still present” messages. Automation may delay an absence action under its recognition-fallback policy, so its playback decision can differ from the raw sensed state.
-
-Absence is not proof that a room is empty. Motion alone can miss a stationary person, and detection accuracy depends on the camera and scene. This is not an identity system, screen unlocker, or kiosk lockdown tool.
-
-## Use in your app
-
-### Add the package
-
-In Xcode, add this repository as a package dependency and select `PresenceKit`. Also select `PresencePlayback` for player integration. For a `Package.swift` manifest, add:
+In Xcode, add this repository as a package dependency and select **`PresenceKit`**. No playback product is needed. For a `Package.swift` manifest, use these entries:
 
 ```swift
 // In your package's dependencies:
 .package(url: "https://github.com/jmonster/PresenceKit.git", exact: "0.1.0-beta.2")
 
 // In your application target's dependencies:
-.product(name: "PresenceKit", package: "PresenceKit"),
-.product(name: "PresencePlayback", package: "PresenceKit")
+.product(name: "PresenceKit", package: "PresenceKit")
 ```
 
-`0.1.0-beta.2` includes the supervised player API; `v0.1.0-beta.1` is the earlier sensing baseline. For unreleased changes, pin an inspected full commit rather than assuming that `main` matches a release. See the [release contract](docs/RELEASE_CONTRACT.md) for versioning and migration details.
+This pins a source prerelease. For unreleased changes, pin an inspected full commit rather than assuming `main` matches a release. See the [release contract](docs/RELEASE_CONTRACT.md) for versioning and migration details.
 
-Your host app needs `NSCameraUsageDescription` in its `Info.plist`, plus the camera entitlement when required by its sandbox or hardened-runtime settings. Camera consent belongs to your app. No root access is required.
+Your host app needs `NSCameraUsageDescription` in its `Info.plist`, plus the camera entitlement when required by its sandbox or hardened-runtime settings. Grant camera access to that app when prompted. The camera indicator remains visible during capture; no root access is required.
 
-### Control an existing AVPlayer
+### Listen for events
 
-The controller handles presence decisions, transient camera recovery, and cleanup. Power control is off by default:
+This example observes the room without controlling playback, display power, or any other application behavior:
 
 ```swift
-import AVFoundation
 import PresenceKit
-import PresencePlayback
 
-@MainActor
-func runPresencePlayback(player: AVPlayer) async throws {
-    let controller = try PresencePlayerController(
-        player: player,
-        configuration: .lowPower,
-        manageDisplay: false,
-        keepSystemAwake: false
-    )
+func observePresence() async throws {
+    let monitor = try PresenceMonitor.camera(configuration: .lowPower)
 
-    try await controller.run { event in
-        print(event) // Surface recovery and degraded sensing in your UI.
+    try await monitor.run { event in
+        switch event {
+        case .presenceChanged(let change):
+            print("Presence:", change.current, "Reason:", change.reason)
+        case .lightingChanged(_, let state):
+            print("Lighting:", state)
+        case .statusChanged(let status):
+            print("Sensor:", status)
+        }
     }
 }
 ```
 
-Call this from a SwiftUI `.task` or one AppKit-owned task, and handle errors at that boundary. Keep one controller per active player; do not independently drive the same player while the controller owns playback. Cancel **and await** the run before replacing it. Cancellation pauses playback, releases owned power assertions, and waits for camera cleanup.
+Replace the logging with your application's event handling. Run this from one app-owned task, such as a SwiftUI `.task`, and handle errors at that boundary. `run` continues until cancellation or failure; it does not return after the first event. Cancel **and await** the task before replacing it so camera cleanup finishes first.
 
-The [complete integration example](Examples/PlayerPresence.swift) shows a retained controller and terminal-error handling. Temporary camera faults retry automatically with increasing delays; permission, configuration, and media/power errors require correction. Do not add a second automatic retry loop around the controller.
+Callbacks are ordered and asynchronous, but **not implicitly on MainActor**. Keep them short and cancellation-cooperative; hop to MainActor for UI updates. The event buffer is bounded, and a consumer that cannot keep up fails explicitly instead of silently losing transitions.
 
-### Receive callbacks without controlling playback
+## Recovery and custom behavior
 
-Use `PresenceAutomation` for supervised sensing with your own actions:
+### Choose the policy you need
+
+`PresenceMonitor` manages a single sensing run and emits raw events. It does not retry failures. Use it when your application owns recovery and decision-making.
+
+`PresenceAutomation`, also in the core `PresenceKit` product, adds automatic retries for classified transient sensor faults and a configurable policy for unavailable recognition. It still leaves application actions to you:
 
 ```swift
 import PresenceKit
 
-func watchPresence() async throws {
+func observeWithRecovery() async throws {
     let configuration = PresenceConfiguration.lowPower
     let source = try CameraPresenceSource(configuration: configuration)
     let automation = try PresenceAutomation(
@@ -129,42 +94,66 @@ func watchPresence() async throws {
 
     try await automation.run { event in
         if case .activityChanged(let state) = event {
-            print(state) // Handle present, absent, and unknown here.
+            print("Activity:", state) // Connect your application's behavior here.
         }
     }
 }
 ```
 
-Apply actions to `activityChanged`, the fallback-adjusted decision. `sensing` exposes raw events, `recovery` reports retries and failures, and `modeChanged` reports recognition availability. These callbacks are ordered and asynchronous, but **not implicitly on MainActor**. Keep them short and cancellation-cooperative; hop to MainActor for UI work.
+Use `activityChanged` for decisions that should respect the selected fallback policy. `sensing` wraps unchanged raw presence, lighting, and status events; `modeChanged` exposes recognition availability; `recovery` reports retries, suspension, and failures. Surface those operational events in your app rather than showing only the activity state.
 
-For fully custom policy, use `PresenceMonitor.run` directly; it does not retry. For custom playback or power outputs, implement `PresencePlaybackOutput` and use `PresencePlaybackController`. See [ownership and public entry points](docs/UNATTENDED.md#ownership-and-public-entry-points).
+Retries use increasing delays and do not overlap camera sessions. Permission denial, invalid configuration, and other terminal errors require correction, not another automatic retry loop. The same task ownership and callback rules apply to both APIs. See the [recovery and lifecycle guide](docs/UNATTENDED.md) for the detailed contract.
 
-## Tune detection
+### Supply your own input
 
-Start with `PresenceConfiguration.lowPower`, which uses motion only and a 120-second absence delay. To add recognition, configure it **before** constructing the source or controller:
+The monitor accepts any implementation of [`PresenceSource`](Sources/PresenceKit/Model.swift). The supplied camera source is one implementation; you can write an adapter for another input or inject a synthetic source for testing. Other hardware adapters are not bundled.
+
+A source returns a `PresenceSession` containing samples and session-specific asynchronous cleanup. Custom sources must preserve observation timestamps, cooperate with cancellation, and respect session ownership. See the [architecture](docs/ARCHITECTURE.md) and [source migration contract](docs/RELEASE_CONTRACT.md) before implementing one.
+
+## Configuration
+
+`PresenceConfiguration.lowPower` starts with motion-only sensing: a three-second camera warmup, two positive samples within two seconds to confirm entry, and a 120-second absence delay. Motion compares a 96 × 72 brightness grid at a nominal 500 ms interval. By default, capture requests 5 fps and refuses formats above 640 × 480 or 10 fps.
+
+Configure the source and monitor with the same settings. To add human detection:
 
 ```swift
 var configuration = PresenceConfiguration.lowPower
 configuration.vision.mode = .humanRectangles // Or .faceRectangles.
 configuration.absenceDelay = .seconds(240)
-// configuration.vision.compute = .cpuOnly // Compatibility option.
+
+let monitor = try PresenceMonitor.camera(configuration: configuration)
 ```
 
-The longer absence delay leaves room for budgeted recognition opportunities. With the default enabled-recognition limits, the validated minimum is 208 seconds; 240 seconds is a valid starting point, not a guarantee of stationary-person detection.
+Human/face detection uses Apple Vision and can provide evidence for stationary occupants. It **supplements motion**, rather than making the detector human-only. Its processing budget requires a longer absence window: with the default enabled-recognition limits, the validated minimum is 208 seconds. The example uses 240 seconds; neither setting guarantees detection of a stationary person.
 
-When requested recognition becomes unavailable, the default automation policy continues with motion and adds 120 seconds of grace to a pending present-to-absent transition. It never delays `unknown` or error handling. Choose `.pauseUntilRecovered` to pause while recognition is unavailable; this requires recognition to be enabled and does not make detection human-only. The [fallback guide](docs/UNATTENDED.md#recognition-fallback-and-raw-state) explains degradation and recovery.
+When requested recognition is unavailable, `PresenceAutomation` defaults to accepting motion and adding 120 seconds of grace to a pending present-to-absent transition. It never delays `unknown` or error handling. The alternative `.pauseUntilRecovered` policy requires recognition to be enabled and reports `unknown` activity while recognition is unavailable; your application decides how to respond. Despite its name, that policy does not itself pause anything in your app.
 
-Default motion processing compares a 96 × 72 grid at a nominal 500 ms interval. Capture requests 5 fps and refuses formats above 640 × 480 or 10 fps. Motion and recognition have separate elapsed-time scheduling budgets; overdue work is skipped rather than queued. These are **not CPU percentages, wattage limits, or guaranteed detection latencies**. See [configuration](Sources/PresenceKit/Configuration.swift) for the available settings and validation rules.
+[`PresenceConfiguration`](Sources/PresenceKit/Configuration.swift) also exposes the camera selection, image region, motion thresholds, lighting thresholds, recognition compute mode, and timing limits. Set these before constructing the source or monitor. Use the [fallback guide](docs/UNATTENDED.md) for recognition degradation and recovery behavior.
 
-Raw sensing also provides dark/bright transitions. Camera brightness is a heuristic, not a lux measurement, and light changes alone do not establish presence.
+Motion and recognition have separate elapsed-time scheduling budgets. Overdue work is skipped rather than queued. These are **not CPU percentages, wattage limits, or guaranteed detection latencies**. Camera conditions, stationary occupants, and recognition failures need testing in the intended environment.
 
-## Display sleep is not system sleep
+Camera-backed sensing requires the Mac to remain awake, even when its display is asleep. Waking a fully sleeping Mac in response to occupancy requires an independent sensor. A low-compute preset is not evidence of net energy savings; see the [power acceptance guide](docs/POWER.md).
 
-The display can sleep while the camera keeps monitoring, but the **Mac itself must remain awake**. `--manage-display` / `manageDisplay` and `--keep-awake` / `keepSystemAwake` are independent opt-ins. Local keyboard or mouse input defers forced display sleep for 60 seconds by default. Power control uses temporary holds that are released during cleanup, not persistent system-setting changes.
+## Optional playback example
 
-A fully sleeping Mac cannot detect arrivals with this camera pipeline. Occupancy-triggered wake from whole-system sleep needs an independent sensor. Keeping a Mac awake for sensing may also cost more energy than the display automation saves: measure the complete system using the [power acceptance guide](docs/POWER.md).
+The repository also demonstrates how an application can act on presence events. Neither of these components is required for core sensing:
 
-## Development and project map
+**`PresencePlayback`** is an optional library for connecting presence decisions to playback and display power. Add that product only for this integration. `PresencePlayerController` is the macOS `AVPlayer` entry point; the [complete example](Examples/PlayerPresence.swift) shows controller ownership and error handling. Custom outputs can implement `PresencePlaybackOutput` and use `PresencePlaybackController`.
+
+**`PresenceAgent`** is a windowed local-media player with menu-bar status and diagnostics, built on that public integration. To try it on a Mac:
+
+```sh
+git clone https://github.com/jmonster/PresenceKit.git
+cd PresenceKit
+bash scripts/build-app.sh
+open build/PresenceAgent.app --args --media "/absolute/path/movie.mp4"
+```
+
+Replace the path with a readable, playable local movie and grant camera access. Accepted presence resumes playback; absence pauses it. Media plays once unless you add `--loop`. Quit the running app before relaunching with different arguments. This is a locally built reference app, not a notarized end-user download.
+
+`--manage-display` and `--keep-awake` separately opt into display control and idle-system-sleep prevention. Unknown sensing pauses media without forcing display sleep. See the [player integration guide](docs/UNATTENDED.md) for all options, login installation, local-input grace, and power behavior.
+
+## Development
 
 From the repository root:
 
@@ -174,12 +163,12 @@ swift test -c release
 swift run --package-path Examples/PackageClient -c release PackageClient
 ```
 
-The [CI workflow](.github/workflows/ci.yml) defines native Intel and Apple-silicon tests, app packaging, integration-example typechecking, and portable Linux tests. Linux coverage exercises portable logic; it does not make the camera or player app available on Linux. Native tests use synthetic sensors and mock power outputs rather than opening a camera or forcing display sleep. Check CI artifacts for actual results; passing software tests does not establish detection accuracy or energy savings on your hardware.
+The [CI workflow](.github/workflows/ci.yml) defines Intel and Apple-silicon tests, app packaging, integration-example typechecking, and portable Linux tests. Linux coverage exercises portable logic, not camera capture or the macOS app. Native tests use synthetic sensors and mock power outputs. Check CI artifacts for actual results; passing software tests does not establish hardware detection accuracy or energy savings.
 
 ```text
-Sources/PresenceKit/       Camera input, state changes, configuration, recovery
-Sources/PresencePlayback/  Playback actions, display power, lifecycle management
-Sources/PresenceAgent/     Reference app and command-line options
+Sources/PresenceKit/       Sensing, events, configuration, recovery, source interfaces
+Sources/PresencePlayback/  Optional playback, display power, lifecycle integration
+Sources/PresenceAgent/     Reference media-player app
 Examples/                 Host integration and an external package consumer
 Tests/                    Sensing and playback tests
 scripts/                  App packaging, login installation, release tooling
@@ -187,10 +176,10 @@ scripts/                  App packaging, login installation, release tooling
 
 | Read next | What you will find |
 | --- | --- |
-| [Unattended operation](docs/UNATTENDED.md) | Ownership, retries, fallback, display behavior, and agent options. |
-| [Architecture](docs/ARCHITECTURE.md) | How capture, freshness, scheduling, and concurrency fit together. |
+| [Architecture](docs/ARCHITECTURE.md) | Capture, observation freshness, scheduling, concurrency, and source ownership. |
+| [Recovery and integration](docs/UNATTENDED.md) | Retry and fallback policies, lifecycle contracts, and the optional player. |
 | [macOS validation](docs/MACOS_VALIDATION.md) | What validation evidence covers and what still needs hardware testing. |
-| [Power acceptance](docs/POWER.md) | How to measure whether the complete setup saves energy. |
+| [Power acceptance](docs/POWER.md) | How to measure complete-system energy rather than just processing time. |
 | [Release contract](docs/RELEASE_CONTRACT.md) and [changelog](CHANGELOG.md) | Prerelease guarantees, migration notes, and changes between versions. |
 
 ## License
