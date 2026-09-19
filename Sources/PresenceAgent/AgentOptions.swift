@@ -8,7 +8,8 @@ struct AgentOptions {
     var mediaPath: String?
     var manageDisplay = false
     var keepAwake = false
-    var loop = true
+    var loop = false
+    var inputGraceSeconds = 60.0
 
     init(arguments: [String]) throws {
         var i = 0, human = false, face = false, absence: Double?, grace = 120.0, fallbackName = "motion"
@@ -31,7 +32,9 @@ struct AgentOptions {
             case "--human": human = true
             case "--face": face = true
             case "--cpu-only": configuration.vision.compute = .cpuOnly
+            case "--loop": loop = true
             case "--no-loop": loop = false
+            case "--input-grace-seconds": inputGraceSeconds = try number(value(), arg)
             case "--absence-seconds": absence = try number(value(), arg)
             case "--fallback-grace-seconds": grace = try number(value(), arg)
             case "--fallback": fallbackName = try value()
@@ -53,7 +56,12 @@ struct AgentOptions {
         case "pause": fallback = .pauseUntilRecovered
         default: throw PresenceError.invalidConfiguration("--fallback must be motion or pause")
         }
-        keepAwake = keepAwake || manageDisplay
+        guard (0...3600).contains(inputGraceSeconds) else {
+            throw PresenceError.invalidConfiguration("Input grace must be 0...3600 seconds")
+        }
+        if fallback == .pauseUntilRecovered, configuration.vision.mode == .disabled {
+            throw PresenceError.invalidConfiguration("--fallback pause requires --human or --face")
+        }
         try configuration.validate()
     }
 }

@@ -10,7 +10,7 @@ struct PresenceAgentMain {
     static func main() {
         do {
             if CommandLine.arguments.contains("--help") {
-                print("PresenceAgent [--media /path/movie.mp4] [--manage-display] [--keep-awake] [--human | --face] [--cpu-only] [--absence-seconds N] [--fallback motion|pause] [--fallback-grace-seconds N] [--no-loop]")
+                print("PresenceAgent [--media /path/movie.mp4] [--manage-display] [--keep-awake] [--human | --face] [--cpu-only] [--absence-seconds N] [--fallback motion|pause] [--fallback-grace-seconds N] [--input-grace-seconds N] [--loop]")
                 return
             }
             if CommandLine.arguments.contains("--self-test") {
@@ -42,7 +42,10 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
     private var item: NSStatusItem?
     private var statusItem: NSMenuItem?
     private var recoveryText = "Starting"
-    private var recognitionText = ""
+    private var sensedText = "unknown"
+    private var activityText = "unknown"
+    private var recognitionText = "Mode: motion only"
+    private var diagnosticsTask: Task<Void, Never>?
     private var controller: PresencePlayerController?
     private var player: AVQueuePlayer?
     private var looper: AVPlayerLooper?
@@ -59,6 +62,10 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let retry = menu.addItem(withTitle: "Restart monitoring", action: #selector(restart), keyEquivalent: "r")
         retry.target = self
+        let reload = menu.addItem(withTitle: "Reload media and restart", action: #selector(reloadMedia), keyEquivalent: "")
+        reload.target = self
+        let diagnostics = menu.addItem(withTitle: "Show diagnostics", action: #selector(showDiagnostics), keyEquivalent: "d")
+        diagnostics.target = self
         let quit = menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         item.menu = menu; self.item = item
@@ -71,11 +78,11 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             defer {
                 self.player?.pause(); self.window?.orderOut(nil)
-                self.controller = nil; self.looper?.disableLooping(); self.looper = nil
+                self.controller = nil
             }
             do {
-                let player = AVQueuePlayer(); self.player = player
-                if let path = options.mediaPath {
+                let player = self.player ?? AVQueuePlayer()
+                if self.player == nil, let path = options.mediaPath {
                     let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
                     guard FileManager.default.isReadableFile(atPath: url.path) else {
                         throw PresencePlaybackError.media("The media file is not readable")
@@ -100,8 +107,10 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
                     }
                     window?.contentView = view
                 }
+                self.player = player
                 let controller = try PresencePlayerController(player: player, configuration: options.configuration,
-                    fallback: options.fallback, manageDisplay: options.manageDisplay, keepSystemAwake: options.keepAwake) { [weak self] visible in
+                    fallback: options.fallback, manageDisplay: options.manageDisplay, keepSystemAwake: options.keepAwake,
+                    userInputGraceSeconds: options.inputGraceSeconds) { [weak self] visible in
                         if visible { self?.window?.orderFront(nil) }
                         else { self?.window?.orderOut(nil) }
                     }
@@ -110,7 +119,7 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
             } catch is CancellationError {
                 setStatus("Stopped")
             } catch {
-                let message = "Stopped: \(error). Use Restart monitoring after correcting the problem."
+                let message = "Stopped: \(error). Correct the problem, then Restart monitoring (or Reload media for a media error)."
                 log.error("\(message, privacy: .public)"); setStatus(message)
             }
         }
@@ -119,43 +128,78 @@ final class AgentDelegate: NSObject, NSApplicationDelegate {
     private func handle(_ event: PresenceAutomationEvent) {
         switch event {
         case .activityChanged(let activity):
-            recoveryText = "Activity: \(activity.rawValue)"
+            activityText = activity.rawValue
+        case .sensing(.presenceChanged(let change)):
+            sensedText = change.current.rawValue
+        case .recovery(.monitoring): recoveryText = "Monitoring"
         case .recovery(.retryScheduled(let attempt, let delay, let cause)):
             recoveryText = "Retry \(attempt) in \(delay): \(cause)"
         case .recovery(.failed(let error)):
             recoveryText = "Stopped: \(error)"
-        case .sensing(.statusChanged(.recognition(let status))):
-            recognitionText = "Recognition: \(status)"
+        case .modeChanged(let mode):
+            switch mode {
+            case .motionOnly: recognitionText = "Mode: motion only (stationary people may be missed)"
+            case .semantic: recognitionText = "Mode: motion + recognition"
+            case .motionFallback(let status): recognitionText = "Mode: motion fallback — \(status)"
+            case .unavailable(let status): recognitionText = "Paused: recognition required — \(status)"
+            }
+        case .recovery(.recovered): recoveryText = "Sensing recovered"
+        case .recovery(.suspended): recoveryText = "Suspended: system sleep or inactive session"
+        case .recovery(.stopped): recoveryText = "Stopped"
         case .sensing(.statusChanged(.starting)):
-            recoveryText = "Starting / awaiting camera permission"; recognitionText = ""
+            recoveryText = "Starting / awaiting camera permission"
         default: return
         }
-        let text = recognitionText.isEmpty ? recoveryText : recoveryText + " • " + recognitionText
+        let text = recoveryText + " • sensed: " + sensedText + " • playback: " + activityText + " • " + recognitionText
         log.info("\(text, privacy: .public)"); setStatus(text)
     }
     private func setStatus(_ text: String) {
         statusItem?.title = text; item?.button?.toolTip = text
     }
-    @objc private func restart() {
+    @objc private func restart() { restart(reload: false) }
+    @objc private func reloadMedia() { restart(reload: true) }
+    private func restart(reload: Bool) {
         guard restartTask == nil, !terminating else { return }
-        let old = task; task = nil; old?.cancel()
+        let old = task, diagnostics = diagnosticsTask
+        task = nil; old?.cancel(); diagnostics?.cancel()
         restartTask = Task { [weak self] in
-            await old?.value
+            await old?.value; await diagnostics?.value
             guard let self else { return }
             self.restartTask = nil
+            guard !Task.isCancelled, !self.terminating else { return }
+            if reload {
+                self.looper?.disableLooping(); self.looper = nil
+                self.player?.removeAllItems(); self.player = nil
+            }
             self.start()
+        }
+    }
+    @objc private func showDiagnostics() {
+        guard diagnosticsTask == nil, let controller, !terminating else { return }
+        diagnosticsTask = Task { [weak self] in
+            let stats = await controller.statistics(), camera = await controller.cameraStatistics()
+            guard let self else { return }
+            defer { self.diagnosticsTask = nil }
+            guard !Task.isCancelled, !self.terminating else { return }
+            var text = "Attempts: \(stats.attempts), retries: \(stats.retries); active sensing: \(stats.activeTime), inactive/backoff: \(stats.inactiveTime). Mode: \(stats.mode)"
+            if let camera {
+                text += "\nCapture: \(camera.configuredWidth)×\(camera.configuredHeight) @ \(camera.configuredFPS) fps. Analyzed: \(camera.analyzedFrames), dropped: \(camera.droppedFrames). Motion interval: \(camera.effectiveMotionInterval); Vision interval: \(camera.effectiveVisionInterval)."
+            }
+            self.log.info("\(text, privacy: .public)")
+            self.setStatus(text)
         }
     }
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateLater }
         terminating = true
-        let old = task, restart = restartTask
-        task = nil; restartTask = nil
-        old?.cancel(); restart?.cancel()
+        let old = task, restart = restartTask, diagnostics = diagnosticsTask
+        task = nil; restartTask = nil; diagnosticsTask = nil
+        old?.cancel(); restart?.cancel(); diagnostics?.cancel()
         player?.pause(); window?.orderOut(nil)
         Task {
-            await restart?.value; await old?.value
+            await restart?.value; await old?.value; await diagnostics?.value
+            self.looper?.disableLooping(); self.looper = nil; self.player = nil
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

@@ -22,11 +22,18 @@ public enum PresenceEvent: Sendable, Equatable {
     case statusChanged(PresenceStatus)
 }
 
+/// Only these explicitly classified transport faults are automatically retried.
+/// Unclassified driver/programming errors remain terminal, regardless of their text.
+public enum CaptureFailureReason: String, Sendable, Equatable {
+    case interrupted, disconnected, deviceInUse, mediaServicesReset
+}
+
 public enum PresenceError: Error, Sendable, Equatable, CustomStringConvertible {
     case invalidConfiguration(String)
     case alreadyRunning
     case cameraPermissionDenied
     case cameraUnavailable(String)
+    case captureFailure(CaptureFailureReason)
     case cameraConfigurationUnsupported(String)
     case sensorStalled
     case startupTimedOut
@@ -38,6 +45,7 @@ public enum PresenceError: Error, Sendable, Equatable, CustomStringConvertible {
         case .invalidConfiguration(let message): "Invalid configuration: \(message)"
         case .alreadyRunning: "This monitor/source already has a running session"
         case .cameraPermissionDenied: "Camera access denied; check the host app's camera permission and usage description"
+        case .captureFailure(let reason): "Capture interrupted: \(reason.rawValue)"
         case .cameraUnavailable(let message): "Camera unavailable: \(message)"
         case .cameraConfigurationUnsupported(let message): "Unsupported camera configuration: \(message)"
         case .sensorStalled: "No fresh camera frames arrived within sensorTimeout"
@@ -75,7 +83,7 @@ public enum RecognitionFailure: Sendable, Equatable {
     case frameCopyFailed, inferenceFailed(String), durationBudgetExceeded
 }
 public enum RecognitionStatus: Sendable, Equatable {
-    case disabled, active, thermalPressure, cadenceExceeded
+    case disabled, warmingUp, active, thermalPressure, cadenceExceeded
     case failed(RecognitionFailure)
 }
 public enum PresenceStatus: Sendable, Equatable {

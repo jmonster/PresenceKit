@@ -5,6 +5,8 @@ import PresencePlayback
 /// Retain this in the host. Call run() from SwiftUI .task or one AppKit-owned task.
 /// Transient camera failures are retried automatically. The view/UI should surface
 /// lastStatus; permission/configuration/output failures require explicit correction.
+/// After a terminal return, a Retry button may call run() again. Await the prior
+/// lifecycle task before replacing it; never add an independent retry loop.
 @MainActor
 final class PlayerPresence {
     let player: AVPlayer
@@ -20,7 +22,8 @@ final class PlayerPresence {
         // config.absenceDelay = .seconds(240)
         controller = try PresencePlayerController(player: player, configuration: config,
             fallback: .motionOnly(additionalAbsenceDelay: .seconds(120)),
-            manageDisplay: true)
+            manageDisplay: false, // Opt in only after choosing the host's display policy.
+            keepSystemAwake: false) // Independent opt-in; never prevents explicit user sleep.
     }
     func run() async {
         do {

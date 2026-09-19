@@ -50,6 +50,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
     private var output: AVCaptureVideoDataOutput?
     private var continuation: AsyncThrowingStream<PresenceSample, Error>.Continuation?
     private var errorObserver: NSObjectProtocol?
+    private var interruptionObservers: [NSObjectProtocol] = []
     private var motion: MotionDetector
     private var motionGate: WorkGate
     private var visionGate: WorkGate
@@ -101,11 +102,11 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
             return PresenceSession(samples: stream) { [self] in await close(lease: id) }
         } catch {
             await close(lease: id)
-            // AVFoundation input/lock failures are transport failures. Keep
-            // explicit configuration/permission/cancellation errors unchanged.
+            // Retry only documented AVFoundation transport reasons. Unknown
+            // errors and unsupported configuration remain terminal.
             if error is CancellationError { throw error }
             if let typed = error as? PresenceError { throw typed }
-            throw PresenceError.cameraUnavailable(String(describing: error))
+            throw Self.classify(error)
         }
     }
 
@@ -132,7 +133,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         await withCheckedContinuation { reply in queue.async { reply.resume(returning: self.stats) } }
     }
 
-    /// Call after your application changes the display/backlight. This is optional;
+    /// Await BEFORE your application changes the display/backlight or hides/shows media. This is optional;
     /// the library never changes display or system power settings itself.
     public func suppressMotion(for duration: Duration = .seconds(3)) async {
         await withCheckedContinuation { reply in
@@ -160,7 +161,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         if let id = config.camera.uniqueID {
             device = AVCaptureDevice(uniqueID: id)
         } else { device = AVCaptureDevice.default(for: .video) }
-        guard let device else { throw PresenceError.cameraUnavailable("No matching video device") }
+        guard let device else { throw PresenceError.captureFailure(.disconnected) }
         self.device = device
         let s = AVCaptureSession()
         // Store early so failures have an owned session to unwind.
@@ -195,21 +196,52 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         visionGate = WorkGate(minimumInterval: config.vision.minimumInterval, maximumDutyCycle: config.vision.maximumDutyCycle)
         visionDisabled = config.vision.mode == .disabled
         stats = CameraStatistics()
-        setRecognition(visionDisabled ? .disabled : .active)
+        setRecognition(visionDisabled ? .disabled : .warmingUp)
         let now = clock.now
         readyAt = now.advanced(by: config.camera.warmup); suppressUntil = readyAt
         analyzedAt = nil; motionAt = nil; lightMeasuredAt = nil; lightReading = nil
         nextHeartbeat = now; nextLightPoll = now; nextFormatCheck = now
         recognitionDeadline = visionDisabled ? nil : readyAt.advanced(by: config.vision.maximumInferenceDuration + config.sensorTimeout)
+        let captureGeneration = generation
         errorObserver = NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: s, queue: nil) { [weak self] note in
-            let message = String(describing: note.userInfo?[AVCaptureSessionErrorKey] ?? "capture runtime error")
+            let error = Self.classify(note.userInfo?[AVCaptureSessionErrorKey] as? NSError ??
+                NSError(domain: "PresenceKit.capture", code: -1))
             self?.queue.async { [weak self] in
-                self?.continuation?.finish(throwing: PresenceError.cameraUnavailable(message))
+                guard let self, self.generation == captureGeneration else { return }
+                self.failCapture(error)
             }
         }
+        interruptionObservers = [
+            NotificationCenter.default.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: s, queue: nil) { [weak self] _ in
+                self?.queue.async { [weak self] in
+                    guard let self, self.generation == captureGeneration else { return }
+                    self.failCapture(PresenceError.captureFailure(.interrupted))
+                }
+            },
+            NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: device, queue: nil) { [weak self] _ in
+                self?.queue.async { [weak self] in
+                    guard let self, self.generation == captureGeneration else { return }
+                    self.failCapture(PresenceError.captureFailure(.disconnected))
+                }
+            }
+        ]
         s.startRunning() // Blocking legacy API; never blocks MainActor or the cooperative pool.
         guard s.isRunning else { throw PresenceError.cameraUnavailable("Capture session failed to start") }
         try verifyDeviceConfiguration(device)
+    }
+
+    /// Domain/code classification, never matching localized diagnostic messages.
+    static func classify(_ error: any Error) -> PresenceError {
+        if let typed = error as? PresenceError { return typed }
+        let value = error as NSError
+        guard value.domain == AVFoundationErrorDomain else { return .cameraUnavailable(value.localizedDescription) }
+        switch AVError.Code(rawValue: value.code) {
+        case .deviceWasDisconnected: return .captureFailure(.disconnected)
+        case .deviceInUseByAnotherApplication: return .captureFailure(.deviceInUse)
+        case .mediaServicesWereReset: return .captureFailure(.mediaServicesReset)
+        case .applicationIsNotAuthorizedToUseDevice: return .cameraPermissionDenied
+        default: return .cameraUnavailable(value.localizedDescription)
+        }
     }
 
     private func selectFormat(_ device: AVCaptureDevice) throws {
@@ -273,6 +305,8 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         generation += 1
         if let errorObserver { NotificationCenter.default.removeObserver(errorObserver) }
         errorObserver = nil
+        for observer in interruptionObservers { NotificationCenter.default.removeObserver(observer) }
+        interruptionObservers.removeAll()
         output?.setSampleBufferDelegate(nil, queue: nil)
         session?.stopRunning(); output = nil; session = nil; device = nil
         continuation?.finish(); continuation = nil
@@ -286,7 +320,7 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
         // Check delivered dimensions on EVERY frame, before sampling or copying.
         guard CaptureFormatPolicy.dimensionsFit(width: CVPixelBufferGetWidth(buffer),
             height: CVPixelBufferGetHeight(buffer), settings: config.camera) else {
-            failCapture(PresenceError.cameraUnavailable("Delivered frame exceeds the configured resolution caps"))
+            failCapture(PresenceError.cameraConfigurationUnsupported("Delivered frame exceeds the configured resolution caps"))
             return
         }
         // Recheck readback cheaply once per second to catch another client/driver
@@ -356,7 +390,9 @@ public final class CameraPresenceSource: NSObject, PresenceSource,
             visionDisabled = true; setRecognition(.failed(.frameCopyFailed)); recognitionDeadline = nil; return
         }
         visionBusy = true
-        setRecognition(.active)
+        if stats.recognitionStatus != .active || recognitionDeadline.map({ time >= $0 }) == true {
+            setRecognition(.warmingUp)
+        }
         recognitionDeadline = time.advanced(by: config.vision.maximumInferenceDuration + config.sensorTimeout)
         let owned = OwnedPixelBuffer(value: copy)
         let version = generation, config = self.config

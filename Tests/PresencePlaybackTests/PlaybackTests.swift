@@ -43,13 +43,17 @@ private final class OutputSpy: PlaybackOutput {
         trace.append("suppress")
         if delaySuppression { await withCheckedContinuation { suppression = $0 } }
     }
-    func wake() throws {
-        trace.append("wake")
+    func wake(permit: @escaping @Sendable () -> Bool) throws {
+        guard permit() else { return }; trace.append("wake")
         if cancelOnWake { withUnsafeCurrentTask { $0?.cancel() } }
         if wakeError { throw PresencePlaybackError.power("wake failed") }
     }
     func setPlaying(_ playing: Bool) { trace.append(playing ? "play" : "pause") }
-    func sleep() async throws { trace.append("sleep") }
+    func setMonitoring(_ active: Bool, permit: @escaping @Sendable () -> Bool) { trace.append(active ? "hold-system" : "release-system") }
+    func sleep(permit: @escaping @Sendable () -> Bool) async throws -> PresenceDisplaySleepResult {
+        if permit() { trace.append("sleep") }
+        return .finished
+    }
     func releaseDisplay() { trace.append("release") }
     func end() { trace.append("end") }
 }
@@ -83,15 +87,21 @@ final class PlaybackTests: XCTestCase {
     func testAbsencePausesBeforeDisplaySleep() async throws {
         let source = OutputSource(), spy = OutputSpy(), coordinator = PlaybackCoordinator(output: spy)
         let a = try automation(source, absence: .seconds(1))
-        do {
+        let task = Task {
             try await coordinator.run(automation: a) { event in
                 if case .recovery(.monitoring) = event { await source.send() }
-                if case .activityChanged(.absent) = event { await source.fail() }
             }
-        } catch { XCTAssertEqual(error as? PresenceError, .cameraPermissionDenied) }
+        }
+        try await eventually { spy.trace.contains("sleep") }
+        await source.fail()
+        do { try await task.value; XCTFail("Expected failure") }
+        catch { XCTAssertEqual(error as? PresenceError, .cameraPermissionDenied) }
         let sleep = try XCTUnwrap(spy.trace.firstIndex(of: "sleep"))
-        XCTAssertEqual(Array(spy.trace[(sleep - 2)...sleep]), ["pause", "suppress", "sleep"])
+        let pause = try XCTUnwrap(spy.trace[..<sleep].lastIndex(of: "pause"))
+        XCTAssertEqual(spy.trace[pause - 1], "suppress")
+        XCTAssertLessThan(pause, sleep)
     }
+
     func testWakeFailureNeverStartsMediaAndCleansUp() async throws {
         let source = OutputSource(), spy = OutputSpy(), coordinator = PlaybackCoordinator(output: spy)
         spy.wakeError = true
@@ -109,7 +119,7 @@ final class PlaybackTests: XCTestCase {
         spy.beginError = true
         do { try await coordinator.run(automation: automation(source)) { _ in }; XCTFail("Expected error") }
         catch { XCTAssertEqual(error as? PresencePlaybackError, .power("begin failed")) }
-        XCTAssertEqual(spy.trace, ["begin", "pause", "end"])
+        XCTAssertEqual(spy.trace, ["begin", "pause", "release", "release-system", "end"])
         let stops = await source.stops; XCTAssertEqual(stops, 0)
     }
     func testCancellationPausesBeforeDelayedCameraCleanup() async throws {
@@ -210,6 +220,9 @@ final class PlaybackTests: XCTestCase {
         } catch { XCTAssertEqual(error as? PresenceError, .cameraPermissionDenied) }
         XCTAssertTrue(visible.contains(true)); XCTAssertEqual(visible.last, false)
         XCTAssertEqual(player.rate, 0)
+    }
+    func testAnyInputEventSentinelWithoutDisplaySideEffects() throws {
+        XCTAssertNoThrow(try SystemDisplayPower.anyInputEvent())
     }
     func testInvalidPowerGraceRejectedBeforeCameraUse() async throws {
         XCTAssertThrowsError(try PresencePlayerController(player: AVPlayer(), userInputGraceSeconds: .nan))

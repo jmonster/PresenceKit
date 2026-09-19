@@ -1,53 +1,93 @@
-# Unattended operation
+# Unattended player integration
 
-## Supported integration
+## Ownership and public entry points
 
-Import the `PresencePlayback` product for a lifecycle-owned `PresencePlayerController`. It owns playback while `run()` is active. Retain it once, call `run()` from one task, and cancel/await that task on shutdown. Do not use the raw sensing events to independently control the same player: `activityChanged` is the fallback-adjusted output decision.
+`PresenceMonitor.run` remains a single, run-until-failure sensing operation. Opt into `PresenceAutomation` for recovery and presentation policy; opt into `PresencePlayback` for actions. The camera convenience initializer of `PresencePlayerController` shares all of this behavior between the agent and `Examples/PlayerPresence.swift`.
 
-The lower-level `PresenceAutomation` actor is platform-independent and accepts a `PresenceSource`. It supplies ordered `activityChanged`, raw `sensing`, and `recovery` callbacks. The `PresenceMonitor` interface is unchanged for applications that implement their own policies.
+Retain one controller and await `run` from one lifecycle task. Cancel and **await** that task before replacing it. A run does not return until its capture lease, old inference, output operations and pending display deadline have drained. A failed competing start cannot stop the owner. After a terminal error, correct the cause and explicitly call `run` again; do not surround it with a second automatic retry loop.
 
-## Failure and retry contract
+Custom hosts can implement the public `PresencePlaybackOutput` protocol and use `PresencePlaybackController`. UI methods are MainActor-isolated; legacy power work belongs on a confined utility queue. The `permit` closure must be checked immediately before a queued wake/hold/sleep action, and cancellation must drain owned work. Cleanup methods must work even in a cancelled task. `PresenceLifecycle` combines independent host, system-sleep and inactive-session suspension reasons without polling or overlapping runs.
 
-Camera transport failure, missing frames and unexpected stream completion retry at 2, 4, 8, 16, 32, then 60 seconds by default. Delays stay capped; there are no catch-up bursts or overlapping capture sessions. Only 120 seconds of a running attempt resets the streak. Cancellation ends backoff immediately and does not schedule another attempt. A configurable maximum retry count can stop repeated failures.
+The camera-backed AVPlayer controller observes documented NSWorkspace sleep/wake and user-session notifications. Suspension pauses/hides and releases assertions; resumption waits for teardown and reacquires fresh observations. The custom-sensor initializer does not install workspace observers: its host can use `PresenceLifecycle` explicitly. Neither path unlocks a screen or overrides explicit user sleep.
 
-Permission denial, invalid configuration, unsupported capture caps, a competing session, a slow callback consumer, an unanswered startup deadline and unknown custom errors are terminal. The menu remains visible with a diagnostic. Correct the problem and use **Restart monitoring**; rebuilding a session or granting permission never requires root. An unanswered permission dialog is not retried every minute.
+## Retry and failure policy
 
-The host pauses media and releases the display hold when sensing becomes unknown. It never calls unknown a vacancy or forcibly blanks the display on that basis. Explicit display management holds the system awake during transient recovery so normal idle sleep cannot strand the retry task. All its assertions are released on terminal exit/cancellation. It does not override intentional system sleep, log out, a lock screen, or another application's assertions.
+Default transient backoff is 2, 4, 8, 16, 32, then 60 seconds, with a configurable ceiling and optional retry-count limit. Monotonic delays are cancellation-aware. Inject `PresenceClock` and `PresenceRetryPolicy.jitter` for deterministic testing; jitter defaults to identity and is clamped to 100 milliseconds through the configured ceiling.
 
-AVPlayer and current-item failures are monitored using KVO. Output/power errors are terminal and visible; they do not trigger repeated camera reconnection. After failure the player is paused, display assertions are released, and capture cleanup is awaited. KVO callbacks and cancellation carry a run generation, preventing late notifications from affecting a replacement run. Application callbacks must remain short and cancellation-cooperative; Swift cannot forcibly kill arbitrary blocking application code.
+Only typed `captureFailure` reasons (`interrupted`, `disconnected`, `deviceInUse`, `mediaServicesReset`), frame-delivery stalls and unexpected stream termination retry. The camera maps documented AVFoundation error domain/codes and interruption/disconnection notifications. An unmatched configured device is treated as disconnected; correct an erroneous device ID manually. Unclassified `cameraUnavailable(String)` is **terminal**, even when its text sounds transient. Custom sources must supply typed reasons rather than localized-message matching.
 
-## Recognition fallback
+Permission denial, invalid settings, unsupported capture limits, duplicate ownership, slow consumers, unclassified errors and startup timeout are terminal. The startup deadline includes authorization waiting. It does not repeatedly open a permission dialog. An answer arriving after cancellation/timeout cannot revive an abandoned startup. A Swift timeout cannot forcibly interrupt arbitrary blocking driver or host code; its owner still awaits cleanup.
 
-With recognition requested, the default fallback is motion-only with 120 seconds of **additional** absence grace. It applies only when an already-active player would become absent while the recognizer is degraded. Fresh movement cancels the pending off decision. Repeated absent samples cannot extend the grace forever. Unknown sensing bypasses the grace immediately.
+Backoff resets only after 120 seconds of sustained fresh analysis by default. The health interval advances with real analysis timestamps, not startup, cached heartbeats, silent time, callback delay or slow teardown. Stale analysis, gaps and unavailable requested recognition break the healthy interval. `monitoring` reports startup; `recovered` requires healthy analysis following a retry. Retrying, terminal, stopped and lifecycle-suspended states are separately observable.
 
-`pauseUntilRecovered` instead pauses while requested recognition is disabled, failed, thermally paused or overdue. It resumes eligibility when recognition reports active. This checks recognition availability, NOT human identity or human-only detection. Motion still counts as presence.
+AVPlayer/current-item failures and power-adapter errors are terminal. They do not repeatedly reconnect the camera. KVO callbacks carry a run generation; late callbacks from a prior run cannot affect a replacement.
 
-Without recognition requested, there is no additional fallback grace. The motion-only absence default remains 120 seconds. Healthy recognition uses the configured budget-compatible absence delay (240 seconds by default in the agent). A stationary person can still be missed; neither mode proves physical absence.
+## Recognition fallback and raw state
 
-## Display and playback ordering
+Apply playback actions to `activityChanged`. `sensing` retains the raw occupancy, lighting and operational events. Presentation decisions never rewrite raw occupancy or turn missing sensing into a confirmed vacant room. `modeChanged` reports motion-only, motion plus recognition, motion fallback with the exact degradation, or unavailable required recognition.
 
-On present: suppress camera motion feedback, acquire the display assertion and request wake, then reveal/play media. On absent: pause/hide immediately, suppress motion feedback, release the display hold and request display sleep. Recent keyboard/mouse input declines forced sleep; macOS's ordinary idle policy then controls it. On unknown/error/cancellation: pause/hide and release holds, but never force display sleep.
+When recognition is requested, the default `.motionOnly(additionalAbsenceDelay: .seconds(120))` accepts motion-only evidence and adds that finite grace only to a present-to-absent decision while recognition is degraded. Repeated absence cannot extend it forever. Arrival cancels it. Unknown bypasses it immediately. Without recognition requested, no extra fallback grace applies.
 
-`manageDisplay` and `keepSystemAwake` default to false in the public controller. Choosing display management implies keeping the system awake. The standalone command line requires `--manage-display` to opt in. Power management uses scoped IOKit assertions, never persistent pmset configuration. The sleep command is a fixed executable/argument, not a shell string; failures and its bounded termination attempt are surfaced. Cancelling while an output transition is suspended cannot later start playback.
+`.pauseUntilRecovered` requires enabled recognition and pauses/hides while it is unavailable. This is an **availability policy**, not identity recognition or a human-only classifier: motion remains additive evidence when the recognizer works.
 
-## Local player and login installation
+| Recognition state | Behavior and recovery |
+| --- | --- |
+| `warmingUp` | No successful inference yet, including after a thermal/cadence interruption. Strict policy remains unknown until a successful result. |
+| `active` | A successful result is available within the source's cadence contract; it need not contain a person. Normal fallback policy resumes. |
+| `thermalPressure` | Expensive inference is suspended, with motion still available. Thermal relief permits another budget-admitted inference; only success restores active recognition. |
+| `cadenceExceeded` | A promised result is overdue. The raw reducer does not silently infer departure from that missing result. A fresh successful result restores availability. |
+| `failed(durationBudgetExceeded)` | Recognition is disabled for this camera session, rather than repeatedly paying an excessive inference cost. Correct settings/conditions and explicitly restart monitoring. |
+| `failed(inferenceFailed)` or `failed(frameCopyFailed)` | Recognition is disabled for the session; the selected fallback remains visible. Explicit restart retries recognition after correction. |
 
-```
+Motion-only fallback cannot reliably detect a stationary person. Neither raw absence nor a functioning recognizer proves that the physical room is empty. Nominal recognition frequency is not guaranteed cadence.
+
+## Playback, display deadlines and power ownership
+
+On presence, cancel and await pending vacancy work, suppress camera feedback **before** illumination-changing actions, optionally wake/hold the display, then show/resume the same AVPlayer. On confirmed absence, suppress feedback before hiding/pausing media, release the display assertion, and optionally request display sleep. Actions are idempotent across duplicate events.
+
+Local keyboard/mouse input defers forced sleep for 60 seconds by default. Exactly one owned monotonic deadline rechecks the latest local input and current policy state. More input may defer that same task again; no second absence event is necessary. An arrival, unknown state, failure, suspension or stop invalidates the sleep permit. The utility worker rechecks it even when a newer presence callback is still buffered. Unknown input age safely declines forced sleep.
+
+Unknown, failure and cancellation pause/hide and release display holds, **without forcing sleep**. Emergency invalidation makes media safe before potentially slow driver cleanup. Normal visibility/power changes are preceded by motion suppression. There are no per-frame subprocesses, busy-polling loops or persistent power-setting changes.
+
+`manageDisplay` and `keepSystemAwake` are independent and both default to false. Display management does not implicitly prevent system sleep. The optional idle-system-sleep assertion exists only while sensing analysis is live and the chosen policy permits operation. It is absent during startup, stale/strict-unavailable sensing, backoff, terminal failure, lifecycle suspension and shutdown. The utility worker owns IOKit assertions and App Nap activity; all are released by awaited cleanup. Even with `keepSystemAwake`, explicit user sleep is not prevented. Without it, ordinary system idle sleep can suspend the camera and retry clock until an external wake; software cannot analyze frames on a sleeping computer.
+
+The display command is the fixed `/usr/bin/pmset displaysleepnow`, never a user-supplied shell string. It has a bounded termination attempt, cancellation signaling, and awaited process teardown. OS wake/sleep requests and synchronous driver calls are not real-time guarantees.
+
+## Launch a local movie
+
+```sh
 bash scripts/build-app.sh
-open build/PresenceAgent.app --args --media /absolute/path/movie.mp4 --manage-display
-bash scripts/install-agent.sh --media /absolute/path/movie.mp4 --manage-display
+open build/PresenceAgent.app --args --media /absolute/path/movie.mp4
+# Explicit display control and independent system-idle hold:
+open build/PresenceAgent.app --args --media /absolute/path/movie.mp4 --manage-display --keep-awake
+# Explicit looping and semantic fallback:
+open build/PresenceAgent.app --args --media /absolute/path/movie.mp4 --loop --human --fallback motion
 ```
 
-Local, finite-duration media is validated before camera access. The agent loops by default through AVPlayerLooper; `--no-loop` plays once. Its duration is loaded asynchronously before loop construction. Media visibility and player actions are MainActor-isolated. It is not a screen unlocker or a full-screen kiosk lockdown.
+Quit the running app before changing launch arguments. Grant camera access to the packaged app when prompted. Motion uses a 120-second absence delay; `--human` or `--face` selects a budget-compatible 240-second default. Use `--fallback pause` for strict recognition availability, `--input-grace-seconds N` for local-input grace, and `--check-config` to validate arguments without any camera/display effects.
 
-The installed LaunchAgent uses `RunAtLoad`, crash-only `KeepAlive` and a 30-second launch throttle. Intentional quit exits successfully and stays stopped. Terminal sensing/media errors leave the menu-bar application running for attention instead of crashing/re-prompting. `bash scripts/uninstall-agent.sh` removes the login agent. Installation validates all arguments before changing an existing installation.
+The agent asynchronously validates local, readable, playable, finite-duration media. Playback is **once by default**; `--loop` explicitly enables AVPlayerLooper, and `--no-loop` remains accepted. This is a windowed reference player, not fullscreen kiosk lockdown. Ordinary presence transitions, reconnects and sleep/session resumptions preserve the player and playback position. **Restart monitoring** retains media; **Reload media and restart** explicitly replaces it (including replay after reaching the end or after a decoder error).
 
-## Acceptance and release scope
+The menu displays raw sensed state, playback decision, actual recognition mode/degradation and recovery status. **Show diagnostics** obtains a one-shot snapshot of actual capture dimensions/rate, analyzed/dropped frames, effective processing intervals, attempts/retries and active/inactive sensing time. These are inexpensive scheduling diagnostics, not CPU percentages, latency guarantees or energy measurements.
 
-Portable tests cover backoff, permanent errors, retry exhaustion, healthy reset, fallback grace, stale notifications, output order and cancellation during suspended output or driver cleanup. Native tests also instantiate the real AVPlayer-backed controller with synthetic sensors; they do not access a camera, microphone, screen capture or real display power. CI validates the packaged app, its arguments, both architectures and a separate consumer package.
+For login startup:
 
-The version tag is published only after all main-branch checks pass. Repository branch protection requires a separate GitHub administration-write capability; publishing a workflow is not evidence of enforcing it. No CI token is granted administration privileges here. See `docs/POWER.md` for the whole-system energy condition; successful tests do not measure watts or occupancy accuracy.
+```sh
+bash scripts/install-agent.sh --media /absolute/path/movie.mp4 --manage-display --keep-awake
+bash scripts/uninstall-agent.sh
+```
 
-Apple references: https://developer.apple.com/documentation/avfoundation/avplayerlooper
-https://developer.apple.com/documentation/iokit/1557134-iopmassertioncreatewithname
-https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/
+The LaunchAgent runs as the normal user, validates arguments before replacing an installation, and uses crash-only KeepAlive with a 30-second launch throttle. Deliberate quit stays stopped. Terminal errors keep the menu available for explicit correction rather than crashing/re-prompting. There is no supplied separate media-app repository, so only this reusable integration and reference app are modified.
+
+## Validation and references
+
+Virtual-clock tests exercise retries, startup cancellation/timeout, teardown ownership, strict fallback and recovery, buffered-state safety, local-input rechecks, duplicate events and combined lifecycle interruptions. Native tests and the real external package consumer supplement the portable suite; they do not open a real camera or force display sleep. See [MACOS_VALIDATION.md](MACOS_VALIDATION.md) for the evidence contract and [POWER.md](POWER.md) for physical acceptance, tracked separately in issue #1.
+
+Official API references used for the native integration:
+
+- https://developer.apple.com/documentation/avfoundation/avcapturesession/wasinterruptednotification
+- https://developer.apple.com/documentation/appkit/nsworkspace/willsleepnotification
+- https://developer.apple.com/documentation/appkit/nsworkspace/sessiondidresignactivenotification
+- https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPMultipleUsers/Concepts/FastUserSwitching.html
+- https://developer.apple.com/documentation/coregraphics/cgeventsource/secondssincelasteventtype(_:eventtype:)
+- https://developer.apple.com/documentation/iokit/1557134-iopmassertioncreatewithname

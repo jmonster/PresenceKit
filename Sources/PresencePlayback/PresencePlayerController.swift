@@ -1,5 +1,7 @@
 #if os(macOS)
 import AVFoundation
+import AppKit
+import CoreGraphics
 import Foundation
 import PresenceKit
 
@@ -11,6 +13,10 @@ public final class PresencePlayerController {
     public let player: AVPlayer
     private let automation: PresenceAutomation
     private let coordinator: PlaybackCoordinator
+    private let lifecycle = PresenceLifecycle()
+    private var running = false
+    private var camera: CameraPresenceSource?
+    private var observeSystemLifecycle = false
 
     public convenience init(player: AVPlayer, configuration: PresenceConfiguration = .lowPower,
                 retry: PresenceRetryPolicy = .init(),
@@ -24,6 +30,7 @@ public final class PresencePlayerController {
         try self.init(player: player, automation: automation, manageDisplay: manageDisplay,
                       keepSystemAwake: keepSystemAwake, userInputGraceSeconds: userInputGraceSeconds,
                       suppressMotion: { await source.suppressMotion() }, visibility: visibility)
+        camera = source; observeSystemLifecycle = true
     }
 
     /// Injection path for custom sensors and integration tests. The caller supplies
@@ -37,13 +44,24 @@ public final class PresencePlayerController {
         }
         self.player = player; self.automation = automation
         coordinator = PlaybackCoordinator(output: MediaPlayerOutput(player: player, suppression: suppressMotion,
-            manageDisplay: manageDisplay, keepAwake: keepSystemAwake || manageDisplay,
+            manageDisplay: manageDisplay, keepAwake: keepSystemAwake,
             inputGrace: userInputGraceSeconds, visibility: visibility))
     }
 
     public func run(onEvent: @escaping @MainActor @Sendable (PresenceAutomationEvent) async -> Void = { _ in }) async throws {
-        try await coordinator.run(automation: automation, onEvent: onEvent)
+        guard !running else { throw PresenceError.alreadyRunning }
+        running = true
+        let workspace = WorkspaceSuspension(lifecycle: lifecycle)
+        if observeSystemLifecycle { workspace.begin() }
+        defer { workspace.end(); running = false }
+        try await lifecycle.run(operation: { [self] in
+            try await coordinator.run(automation: automation, onEvent: onEvent)
+        }, onSuspension: { await onEvent(.recovery(.suspended)) })
     }
+
+    /// Inexpensive snapshots, suitable for a user-invoked diagnostics action.
+    public func statistics() async -> PresenceAutomationStatistics { await automation.statistics() }
+    public func cameraStatistics() async -> CameraStatistics? { await camera?.statistics() }
 }
 
 @MainActor
@@ -67,7 +85,6 @@ private final class MediaPlayerOutput: PlaybackOutput {
     }
     func begin(reportFailure: @escaping @MainActor (PresencePlaybackError) -> Void) throws {
         let id = UUID(); generation = id; report = reportFailure
-        if keepAwake { try power.beginMonitoring() }
         // KVO supports the macOS 13 baseline. Rare metadata events may arrive on
         // arbitrary queues; never send AVPlayerItem objects across those queues.
         observations = [
@@ -94,18 +111,62 @@ private final class MediaPlayerOutput: PlaybackOutput {
         }
     }
     func suppressMotion() async { await suppression() }
-    func wake() throws { if manageDisplay { try power.wake() } }
+    func setMonitoring(_ active: Bool, permit: @escaping @Sendable () -> Bool) async throws {
+        if keepAwake { try await power.setMonitoring(active, permit: permit) }
+    }
+    func wake(permit: @escaping @Sendable () -> Bool) async throws {
+        if manageDisplay { try await power.wake(permit: permit) }
+    }
     func setPlaying(_ playing: Bool) {
         if playing { visibility(true); player.play() }
         else { player.pause(); visibility(false) }
     }
-    func sleep() async throws { if manageDisplay { try await power.sleep(inputGrace: inputGrace) } }
-    func releaseDisplay() { power.releaseDisplay() }
-    func end() {
+    func sleep(permit: @escaping @Sendable () -> Bool) async throws -> PresenceDisplaySleepResult {
+        if manageDisplay { return try await power.sleep(inputGrace: inputGrace, permit: permit) }
+        return .finished
+    }
+    func releaseDisplay() async { await power.releaseDisplay() }
+    func end() async {
         generation = nil
         for observation in observations { observation.invalidate() }
         observations.removeAll(); itemObservation?.invalidate(); itemObservation = nil; report = nil
-        power.close()
+        await power.close()
+    }
+}
+/// Notification callbacks execute on the main operation queue. Removing observers
+/// and generation guarding prevents old notifications from restarting a new owner.
+@MainActor
+private final class WorkspaceSuspension {
+    let lifecycle: PresenceLifecycle
+    private var observers: [NSObjectProtocol] = []
+    private var active = false
+    init(lifecycle: PresenceLifecycle) { self.lifecycle = lifecycle }
+    func begin() {
+        active = true
+        let center = NSWorkspace.shared.notificationCenter
+        let entries: [(Notification.Name, PresenceSuspensionReason, Bool)] = [
+            (NSWorkspace.willSleepNotification, .systemSleep, true),
+            (NSWorkspace.didWakeNotification, .systemSleep, false),
+            (NSWorkspace.sessionDidResignActiveNotification, .inactiveSession, true),
+            (NSWorkspace.sessionDidBecomeActiveNotification, .inactiveSession, false)
+        ]
+        for (name, reason, suspended) in entries {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.active else { return }
+                    self.lifecycle.setSuspended(suspended, for: reason)
+                }
+            })
+        }
+        // Do not open a camera for a background Fast User Switching session.
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        lifecycle.setSuspended(session?[kCGSessionOnConsoleKey] as? Bool != true, for: .inactiveSession)
+        lifecycle.setSuspended(false, for: .systemSleep)
+    }
+    func end() {
+        active = false
+        for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        observers.removeAll()
     }
 }
 #endif

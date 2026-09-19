@@ -15,6 +15,20 @@ private actor SmokeSource: PresenceSource {
     func close() { continuation?.finish(); continuation = nil }
 }
 
+/// A real external consumer of the public adapter API (not @testable).
+@MainActor
+private final class SmokeOutput: PresencePlaybackOutput {
+    var playing = false, ended = false
+    func begin(reportFailure: @escaping @MainActor (PresencePlaybackError) -> Void) {}
+    func suppressMotion() async {}
+    func setMonitoring(_ active: Bool, permit: @escaping @Sendable () -> Bool) async throws {}
+    func wake(permit: @escaping @Sendable () -> Bool) async throws {}
+    func setPlaying(_ playing: Bool) { self.playing = playing }
+    func sleep(permit: @escaping @Sendable () -> Bool) async throws -> PresenceDisplaySleepResult { .finished }
+    func releaseDisplay() async {}
+    func end() async { ended = true }
+}
+
 @main
 struct PackageClient {
     @MainActor
@@ -72,6 +86,22 @@ struct PackageClient {
         guard controlledStates == [.unknown, .present, .unknown] else {
             throw PresenceError.invalidConfiguration("Unexpected automation events: \(controlledStates)")
         }
-        print("External package client passed: sensing, automation, native player controller, ordered callbacks and teardown")
+        let hostSource = SmokeSource(), output = SmokeOutput(), lifecycle = PresenceLifecycle()
+        let hostAutomation = try PresenceAutomation(source: hostSource, configuration: config, retry: retry)
+        let host = PresencePlaybackController(output: output)
+        do {
+            try await lifecycle.run {
+                try await host.run(automation: hostAutomation) { event in
+                    if event == .recovery(.monitoring) { await hostSource.sendPresence() }
+                    if event == .activityChanged(.present) { await hostSource.close() }
+                }
+            }
+        } catch PresenceError.sourceEnded { }
+        guard output.ended, !output.playing else { throw PresenceError.invalidConfiguration("Host output was not cleaned up") }
+        #if os(macOS)
+        print("External package client passed: sensing, recovery, public adapters/lifecycle, native AVPlayer controller and teardown")
+        #else
+        print("External package client passed: sensing, recovery, public adapters/lifecycle and teardown (native AVPlayer excluded on Linux)")
+        #endif
     }
 }

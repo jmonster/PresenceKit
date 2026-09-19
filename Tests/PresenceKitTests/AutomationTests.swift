@@ -45,7 +45,7 @@ final class AutomationTests: XCTestCase {
     }
 
     func testTransientStartupRetriesAndRecovers() async throws {
-        let time = VirtualClock(), source = RecoveringSource([.cameraUnavailable("disconnected")]), log = AutomationLog()
+        let time = VirtualClock(), source = RecoveringSource([.captureFailure(.disconnected)]), log = AutomationLog()
         let automation = try PresenceAutomation(source: source, configuration: config(), clock: time.clock)
         let task = Task { try await automation.run { await log.append($0) } }
         defer { task.cancel() }
@@ -60,7 +60,7 @@ final class AutomationTests: XCTestCase {
     }
     func testPermissionAndConfigurationFaultsNeverRetry() async throws {
         for expected: PresenceError in [.cameraPermissionDenied, .invalidConfiguration("bad"),
-            .cameraConfigurationUnsupported("caps"), .alreadyRunning, .startupTimedOut, .slowConsumer] {
+            .cameraConfigurationUnsupported("caps"), .alreadyRunning, .startupTimedOut, .slowConsumer, .cameraUnavailable("unclassified driver error")] {
             let source = RecoveringSource([expected]), log = AutomationLog()
             let automation = try PresenceAutomation(source: source, configuration: config())
             do { try await automation.run { await log.append($0) }; XCTFail("Expected failure") }
@@ -102,6 +102,8 @@ final class AutomationTests: XCTestCase {
         time.advance(by: .seconds(2)); try await eventually { await log.monitoringCount == 2 }
         await source.fail(); try await eventually { await log.retries == [1, 2] }
         time.advance(by: .seconds(4)); try await eventually { await log.monitoringCount == 3 }
+        await source.send(.init(capturedAt: time.now, motion: true))
+        try await eventually { await log.events.contains(.recovery(.recovered)) }
         time.advance(by: .seconds(3))
         await source.send(.init(capturedAt: time.now, motion: true))
         try await eventually { await a.currentActivity == .present }
@@ -179,4 +181,134 @@ final class AutomationTests: XCTestCase {
         XCTAssertThrowsError(try PresenceAutomation(source: RecoveringSource(), fallback: .motionOnly(additionalAbsenceDelay: .seconds(-1))))
         XCTAssertThrowsError(try PresenceAutomation(source: RecoveringSource(), fallback: .motionOnly(additionalAbsenceDelay: .seconds(3601))))
     }
+    func testJitterCannotRemoveMinimumDelayOrExceedCeiling() throws {
+        var p = PresenceRetryPolicy()
+        p.jitter = { _, _ in .seconds(-100) }
+        XCTAssertEqual(p.delay(forRetry: 9), .milliseconds(100))
+        p.jitter = { _, _ in .seconds(10_000) }
+        XCTAssertEqual(p.delay(forRetry: 1), .seconds(60))
+        p.jitter = { delay, _ in delay / 2 }
+        XCTAssertEqual(p.delay(forRetry: 2), .seconds(2))
+    }
+    func testAllTypedCaptureReasonsRetryButUnknownMessagesDoNot() {
+        for reason: CaptureFailureReason in [.interrupted, .disconnected, .deviceInUse, .mediaServicesReset] {
+            XCTAssertTrue(PresenceError.captureFailure(reason).isRetryable)
+        }
+        XCTAssertFalse(PresenceError.cameraUnavailable("disconnected").isRetryable)
+        XCTAssertFalse(PresenceError.cameraUnavailable("permission denied").isRetryable)
+    }
+    func testStartupTimeDoesNotResetBackoff() async throws {
+        let time = VirtualClock(), source = RecoveringSource([.sensorStalled]), log = AutomationLog()
+        var retry = PresenceRetryPolicy(); retry.resetAfter = .seconds(2)
+        let a = try PresenceAutomation(source: source, configuration: config(), retry: retry, clock: time.clock)
+        let task = Task { try await a.run { await log.append($0) } }; defer { task.cancel() }
+        try await eventually { await log.retries == [1] }
+        time.advance(by: .seconds(2)); try await eventually { await log.monitoringCount == 1 }
+        time.advance(by: .seconds(3))
+        await source.send(.init(capturedAt: time.now, motion: true))
+        try await eventually { await a.currentActivity == .present }
+        await source.fail(); try await eventually { await log.retries == [1, 2] }
+        task.cancel(); _ = await task.result
+    }
+    func testSilenceAndSlowTeardownCannotEarnHealthyReset() async throws {
+        let time = VirtualClock(), source = RecoveringSource([.sensorStalled]), log = AutomationLog()
+        var retry = PresenceRetryPolicy(); retry.resetAfter = .seconds(120)
+        let a = try PresenceAutomation(source: source, configuration: config(), retry: retry, clock: time.clock)
+        let task = Task { try await a.run { await log.append($0) } }; defer { task.cancel() }
+        try await eventually { await log.retries == [1] }
+        time.advance(by: .seconds(2)); try await eventually { await log.monitoringCount == 1 }
+        await source.send(.init(capturedAt: time.now, motion: true))
+        try await eventually { await a.currentActivity == .present }
+        time.advance(by: .seconds(200))
+        try await eventually { await log.retries == [1, 2] }
+        task.cancel(); _ = await task.result
+    }
+    func testRecoveredRequiresAnalysisNotSuccessfulStartup() async throws {
+        let time = VirtualClock(), source = RecoveringSource([.captureFailure(.deviceInUse)]), log = AutomationLog()
+        let a = try PresenceAutomation(source: source, configuration: config(), clock: time.clock)
+        let task = Task { try await a.run { await log.append($0) } }; defer { task.cancel() }
+        try await eventually { await log.retries == [1] }
+        time.advance(by: .seconds(2)); try await eventually { await log.monitoringCount == 1 }
+        let initial = await log.events; XCTAssertFalse(initial.contains(.recovery(.recovered)))
+        await source.send(.init(capturedAt: time.now, analyzedAt: nil, analysisStatus: .warmingUp))
+        try await eventually { await log.events.contains(.sensing(.statusChanged(.analysis(.warmingUp)))) }
+        let warming = await log.events; XCTAssertFalse(warming.contains(.recovery(.recovered)))
+        time.advance(by: .milliseconds(500)); await source.send(.init(capturedAt: time.now, motion: true))
+        try await eventually { await log.events.contains(.recovery(.recovered)) }
+        task.cancel(); _ = await task.result
+        let events = await log.events
+        XCTAssertEqual(events.filter { $0 == .recovery(.recovered) }.count, 1)
+    }
+    func testStrictFallbackWarmupAndEachDegradationRecoverExplicitly() async throws {
+        let time = VirtualClock(), source = RecoveringSource(), log = AutomationLog()
+        var c = config(); c.vision.mode = .humanRectangles; c.absenceDelay = .seconds(240)
+        let a = try PresenceAutomation(source: source, configuration: c, fallback: .pauseUntilRecovered, clock: time.clock)
+        let task = Task { try await a.run { await log.append($0) } }; defer { task.cancel() }
+        try await eventually { await log.monitoringCount == 1 }
+        await source.send(.init(capturedAt: time.now, analyzedAt: time.now, motionAt: time.now,
+            recognitionStatus: .warmingUp, recognitionDeadline: time.now.advanced(by: .seconds(5))))
+        try await eventually { await log.events.contains(.modeChanged(.unavailable(.warmingUp))) }
+        XCTAssertEqual(a.latestActivity, .unknown); XCTAssertFalse(a.sensingAvailable)
+        for degraded: RecognitionStatus in [.thermalPressure, .cadenceExceeded, .failed(.durationBudgetExceeded),
+                                            .failed(.inferenceFailed("test")), .failed(.frameCopyFailed)] {
+            time.advance(by: .milliseconds(100))
+            await source.send(.init(capturedAt: time.now, analyzedAt: time.now, recognitionStatus: .active))
+            try await eventually { a.latestActivity == .present && a.sensingAvailable }
+            time.advance(by: .milliseconds(100))
+            await source.send(.init(capturedAt: time.now, analyzedAt: time.now, recognitionStatus: degraded))
+            try await eventually { await log.events.contains(.modeChanged(.unavailable(degraded))) }
+            XCTAssertEqual(a.latestActivity, .unknown); XCTAssertFalse(a.sensingAvailable)
+        }
+        task.cancel(); _ = await task.result
+        let raw = await log.events.filter { if case .sensing(.presenceChanged(let change)) = $0 { change.current == .present } else { false } }
+        XCTAssertEqual(raw.count, 1, "Presentation degradation must not rewrite raw sensed occupancy")
+    }
+    func testStrictFallbackWithoutRecognitionIsRejected() {
+        XCTAssertThrowsError(try PresenceAutomation(source: RecoveringSource(), fallback: .pauseUntilRecovered))
+    }
+    func testRecognitionDegradationBreaksHealthyResetPeriod() async throws {
+        let time = VirtualClock(), source = RecoveringSource([.sensorStalled]), log = AutomationLog()
+        var c = config(); c.vision.mode = .humanRectangles; c.absenceDelay = .seconds(240)
+        var retry = PresenceRetryPolicy(); retry.resetAfter = .seconds(2)
+        let a = try PresenceAutomation(source: source, configuration: c, retry: retry, clock: time.clock)
+        let task = Task { try await a.run { await log.append($0) } }; defer { task.cancel() }
+        try await eventually { await log.retries == [1] }
+        time.advance(by: .seconds(2)); try await eventually { await log.monitoringCount == 1 }
+        await source.send(.init(capturedAt: time.now, analyzedAt: time.now, motionAt: time.now, recognitionStatus: .active))
+        try await eventually { await log.events.contains(.recovery(.recovered)) }
+        time.advance(by: .seconds(1))
+        await source.send(.init(capturedAt: time.now, analyzedAt: time.now, recognitionStatus: .thermalPressure))
+        try await eventually { await log.events.contains(.modeChanged(.motionFallback(.thermalPressure))) }
+        time.advance(by: .seconds(3))
+        await source.send(.init(capturedAt: time.now, analyzedAt: time.now, recognitionStatus: .active))
+        try await eventually { await a.operatingMode == .semantic }
+        await source.fail(); try await eventually { await log.retries == [1, 2] }
+        task.cancel(); _ = await task.result
+    }
+    func testManualRetryAfterTerminalFailureReusesExclusiveOwner() async throws {
+        let source = RecoveringSource([.cameraPermissionDenied]), log = AutomationLog()
+        let a = try PresenceAutomation(source: source, configuration: config())
+        do { try await a.run { await log.append($0) }; XCTFail("Expected terminal failure") }
+        catch { XCTAssertEqual(error as? PresenceError, .cameraPermissionDenied) }
+        let before = await source.starts; XCTAssertEqual(before, 1)
+        let task = Task { try await a.run { await log.append($0) } }
+        try await eventually { await log.monitoringCount == 1 }
+        task.cancel(); _ = await task.result
+        let starts = await source.starts, stops = await source.stops, maximum = await source.maximumActive
+        XCTAssertEqual(starts, 2); XCTAssertEqual(stops, 1); XCTAssertEqual(maximum, 1)
+    }
+    func testDiagnosticsSeparateActiveAndBackoffTime() async throws {
+        let time = VirtualClock(), source = RecoveringSource([.sensorStalled]), log = AutomationLog()
+        let a = try PresenceAutomation(source: source, configuration: config(), clock: time.clock)
+        let task = Task { try await a.run { await log.append($0) } }; defer { task.cancel() }
+        try await eventually { await log.retries == [1] }
+        time.advance(by: .seconds(2)); try await eventually { await log.monitoringCount == 1 }
+        time.advance(by: .seconds(3)); await source.fail()
+        try await eventually { await log.retries == [1, 2] }
+        let stats = await a.statistics()
+        XCTAssertEqual(stats.attempts, 2); XCTAssertEqual(stats.retries, 2)
+        XCTAssertEqual(stats.inactiveTime, .seconds(2)); XCTAssertEqual(stats.activeTime, .seconds(3))
+        task.cancel(); _ = await task.result
+    }
+
 }

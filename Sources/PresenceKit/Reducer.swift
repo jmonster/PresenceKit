@@ -99,7 +99,7 @@ struct PresenceReducer: Sendable {
         if analysis != publishedAnalysis {
             publishedAnalysis = analysis; events.append(.statusChanged(.analysis(analysis)))
         }
-        let overdue = rawRecognition == .active && recognitionDeadline.map { now >= $0 } == true
+        let overdue = (rawRecognition == .active || rawRecognition == .warmingUp) && recognitionDeadline.map { now >= $0 } == true
         let recognition: RecognitionStatus = overdue ? .cadenceExceeded : rawRecognition
         if recognition != publishedRecognition {
             publishedRecognition = recognition; events.append(.statusChanged(.recognition(recognition)))

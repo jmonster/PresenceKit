@@ -1,13 +1,14 @@
 # Changelog
 
-## 0.1.0-beta.2
+## 0.1.0-beta.2 — supervised host integration
 
-- Add PresenceAutomation with typed recovery and classified capped exponential retries.
-- Add PresencePlayback and PresencePlayerController with tested output ordering, scoped power ownership and AVPlayer error observation.
-- Add bounded recognition-fallback grace and pause-on-degradation policy.
-- Replace the demo retry loop with the public controller; validate arguments, loop loaded local media, expose diagnostics/restart and crash-only login recovery.
-- Preserve the low-level monitor API. Exhaustive error switches must add cameraConfigurationUnsupported.
-- Add portable recovery/output regressions, native controller integration, external-consumer coverage and command-line smoke checks.
+- Add opt-in PresenceAutomation with explicit transient capture reasons, capped/injectable-jitter backoff and reset earned by sustained fresh analysis, not startup or silent/cleanup time.
+- Add PresencePlayback with public injectable adapters, a portable output coordinator, shared suspension lifecycle and AVPlayer controller. Suppress illumination feedback before actions; cancel/recheck deferred display sleep and drain all owned work.
+- Add bounded motion-fallback grace, strict pause-on-degradation, truthful recognition warmup and observable actual mode/recovery. Preserve raw state separately from presentation.
+- Replace demo retry loops with the shared controller; validate local media/options; make looping, reload, display management and idle-system-sleep prevention explicit. Surface mode, raw/presentation state, diagnostics and manual retry; retain crash-only login recovery.
+- Preserve the low-level run-until-failure contract. Exhaustive error/status switches must handle cameraConfigurationUnsupported, captureFailure and recognition warmingUp. Unclassified cameraUnavailable is terminal in the opt-in supervisor.
+- Expand to 108 portable tests, retain all native regressions, exercise public adapters/lifecycle from the separate external SwiftPM consumer and retain eight publication-safety tests. Native counts/results are recorded by the actual run artifacts.
+- Use supported macOS 15 Intel/Apple-silicon runners after macOS 26 jobs remained unassigned; preserve all native checks, macOS 13 deployment targeting and the full Release gate. Retain exact source/tree provenance and Linux/macOS validation logs.
 
 
 ## 0.1.0-beta.1 — macOS build and release validation
@@ -19,7 +20,7 @@
 - Added a Release gate covering both architectures, and beta publication only from a passing main commit. Publication never moves a tag and has eight network-free safety tests.
 - No source-breaking public API changes relative to the lifecycle-hardening revision.
 
-## Unreleased — 0.1 lifecycle and budget hardening
+## Included in 0.1.0-beta.1 — lifecycle and budget hardening
 
 Addresses the source audit of revision 19f0367.
 

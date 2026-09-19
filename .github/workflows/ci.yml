@@ -14,7 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26-intel, macos-26]
+        # macOS 26 pools remained queued without runner assignment on 2026-09-18.
+        # Keep both native architectures and every validation step on supported pools.
+        include:
+          - runner: macos-15-intel
+            architecture: x86_64
+          - runner: macos-15
+            architecture: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     env:
@@ -27,6 +33,7 @@ jobs:
       - name: Toolchain
         run: |
           mkdir -p validation
+          test "$(uname -m)" = "${{ matrix.architecture }}"
           git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD 'HEAD^{tree}' > validation/source-identity.txt
           swift --version | tee validation/toolchain.txt
           xcodebuild -version | tee -a validation/toolchain.txt
