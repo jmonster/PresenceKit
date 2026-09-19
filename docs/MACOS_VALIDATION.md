@@ -34,8 +34,10 @@ The published beta.1 baseline passed 61 portable / 69 native tests; its macOS bu
 
 On September 18, 2026, macOS 26 jobs for PR #4 (run 35403010200) and the initial PR #6 tree (run 35407162345) remained queued without runner assignment. The new workflow uses the supported macOS 15 pools for both architectures with unchanged debug/release, package, no-camera smoke, CLI, example and external-consumer checks. This does not remove a native path, loosen assertions, or treat a queued job as successful. Actual OS/toolchain details and native results must be read from the completed candidate run artifacts.
 
-The current portable suite has 108 tests, including 23 additional recovery/lifecycle/deferred-effect regressions over the initial PR #4 tree. Local Linux Swift 6.2.1 debug/release and external-consumer execution passed; the eight publication-safety checks passed. Native-only tests are additional, and their count/result must come from native execution rather than this local Linux run. Command-line validation has 17 no-side-effect invocations on macOS.
+The current portable suite has 109 tests, including 24 additional recovery/lifecycle/deferred-effect regressions over the initial PR #4 tree. Local Linux Swift 6.2.1 debug/release and external-consumer execution passed; the eight publication-safety checks passed. Native-only tests are additional, and their count/result must come from native execution rather than this local Linux run. Command-line validation has 17 no-side-effect invocations on macOS.
 
 No physical camera, display sleep, energy break-even or target-iMac acceptance was measured by these software tests. Issue #1 remains the separate physical acceptance work item.
 
 Runner references: https://docs.github.com/en/actions/reference/runners/github-hosted-runners and https://docs.github.com/actions/reference/workflow-syntax-for-github-actions
+
+The initial hardening candidate revealed a Swift 6.0 XCTest discovery incompatibility for synchronous MainActor test methods. Those tests now use asynchronous entry points with the same assertions; the Swift 6.0 lane remains required. Unknown-state cleanup also has an explicit regression showing that media/power safety does not wait behind slow camera suppression or teardown. Consult the latest candidate run, not an earlier tree, for the resulting compiler/platform status.

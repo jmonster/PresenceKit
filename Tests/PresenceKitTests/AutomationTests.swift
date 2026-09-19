@@ -181,7 +181,7 @@ final class AutomationTests: XCTestCase {
         XCTAssertThrowsError(try PresenceAutomation(source: RecoveringSource(), fallback: .motionOnly(additionalAbsenceDelay: .seconds(-1))))
         XCTAssertThrowsError(try PresenceAutomation(source: RecoveringSource(), fallback: .motionOnly(additionalAbsenceDelay: .seconds(3601))))
     }
-    func testJitterCannotRemoveMinimumDelayOrExceedCeiling() throws {
+    func testJitterCannotRemoveMinimumDelayOrExceedCeiling() async throws {
         var p = PresenceRetryPolicy()
         p.jitter = { _, _ in .seconds(-100) }
         XCTAssertEqual(p.delay(forRetry: 9), .milliseconds(100))
@@ -190,7 +190,7 @@ final class AutomationTests: XCTestCase {
         p.jitter = { delay, _ in delay / 2 }
         XCTAssertEqual(p.delay(forRetry: 2), .seconds(2))
     }
-    func testAllTypedCaptureReasonsRetryButUnknownMessagesDoNot() {
+    func testAllTypedCaptureReasonsRetryButUnknownMessagesDoNot() async {
         for reason: CaptureFailureReason in [.interrupted, .disconnected, .deviceInUse, .mediaServicesReset] {
             XCTAssertTrue(PresenceError.captureFailure(reason).isRetryable)
         }
@@ -263,7 +263,7 @@ final class AutomationTests: XCTestCase {
         let raw = await log.events.filter { if case .sensing(.presenceChanged(let change)) = $0 { change.current == .present } else { false } }
         XCTAssertEqual(raw.count, 1, "Presentation degradation must not rewrite raw sensed occupancy")
     }
-    func testStrictFallbackWithoutRecognitionIsRejected() {
+    func testStrictFallbackWithoutRecognitionIsRejected() async {
         XCTAssertThrowsError(try PresenceAutomation(source: RecoveringSource(), fallback: .pauseUntilRecovered))
     }
     func testRecognitionDegradationBreaksHealthyResetPeriod() async throws {

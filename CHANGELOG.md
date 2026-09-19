@@ -7,7 +7,7 @@
 - Add bounded motion-fallback grace, strict pause-on-degradation, truthful recognition warmup and observable actual mode/recovery. Preserve raw state separately from presentation.
 - Replace demo retry loops with the shared controller; validate local media/options; make looping, reload, display management and idle-system-sleep prevention explicit. Surface mode, raw/presentation state, diagnostics and manual retry; retain crash-only login recovery.
 - Preserve the low-level run-until-failure contract. Exhaustive error/status switches must handle cameraConfigurationUnsupported, captureFailure and recognition warmingUp. Unclassified cameraUnavailable is terminal in the opt-in supervisor.
-- Expand to 108 portable tests, retain all native regressions, exercise public adapters/lifecycle from the separate external SwiftPM consumer and retain eight publication-safety tests. Native counts/results are recorded by the actual run artifacts.
+- Expand to 109 portable tests, retain all native regressions, exercise public adapters/lifecycle from the separate external SwiftPM consumer and retain eight publication-safety tests. Native counts/results are recorded by the actual run artifacts.
 - Use supported macOS 15 Intel/Apple-silicon runners after macOS 26 jobs remained unassigned; preserve all native checks, macOS 13 deployment targeting and the full Release gate. Retain exact source/tree provenance and Linux/macOS validation logs.
 
 

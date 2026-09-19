@@ -221,7 +221,7 @@ final class PlaybackTests: XCTestCase {
         XCTAssertTrue(visible.contains(true)); XCTAssertEqual(visible.last, false)
         XCTAssertEqual(player.rate, 0)
     }
-    func testAnyInputEventSentinelWithoutDisplaySideEffects() throws {
+    func testAnyInputEventSentinelWithoutDisplaySideEffects() async throws {
         XCTAssertNoThrow(try SystemDisplayPower.anyInputEvent())
     }
     func testInvalidPowerGraceRejectedBeforeCameraUse() async throws {

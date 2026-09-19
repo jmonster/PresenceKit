@@ -130,6 +130,20 @@ public final class PresencePlaybackController {
             case .activityChanged(let next):
                 guard next != state, next == automation.latestActivity else { return }
                 state = next
+                if next == .unknown {
+                    // Logical invalidation is already in force. Do not wait for
+                    // camera suppression or a delayed vacancy operation before
+                    // making output safe; the camera may be in slow teardown.
+                    sleepPermit?.cancel(); deferredSleep?.cancel()
+                    setPlaying(false)
+                    await output.releaseDisplay()
+                    if monitoring {
+                        monitoring = false
+                        try await output.setMonitoring(false) { false }
+                    }
+                    await cancelSleep()
+                    break
+                }
                 await cancelSleep()
                 guard valid(id) else { return }
                 // Suppress before changing visibility, illumination or playback.
@@ -148,9 +162,7 @@ public final class PresencePlaybackController {
                     deferredSleep = Task { [weak self] in
                         await self?.sleepWhileAbsent(automation: automation, generation: id, permit: permit)
                     }
-                case .unknown:
-                    setPlaying(false)
-                    await output.releaseDisplay()
+                case .unknown: break // Handled before potentially slow work above.
                 }
             default: break
             }

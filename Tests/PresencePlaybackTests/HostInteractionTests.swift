@@ -187,6 +187,22 @@ final class HostInteractionTests: XCTestCase {
         task.cancel(); await source.finishCleanup(); _ = await task.result
         XCTAssertEqual(time.pendingSleeps, 0)
     }
+    func testUnknownMakesOutputSafeWithoutWaitingForCameraSuppression() async throws {
+        let time = VirtualClock(), source = HostSource(time), output = HostOutput(time)
+        let c = PresencePlaybackController(output: output, clock: time.clock), a = try automation(source, time)
+        let task = Task { try await c.run(automation: a) }; defer { task.cancel() }
+        try await arrive(source, output, time)
+        output.delaySuppression = true
+        await source.delayCleanup(); await source.fail(.cameraPermissionDenied)
+        try await eventually { await source.cleanup != nil }
+        try await eventually { !output.playing && !output.displayHeld && !output.systemHeld }
+        XCTAssertNil(output.suppressionGate, "Unknown must not queue camera work ahead of safety cleanup")
+        XCTAssertEqual(output.sleeps, 0)
+        await source.finishCleanup()
+        do { try await task.value; XCTFail("Expected terminal error") }
+        catch { XCTAssertEqual(error as? PresenceError, .cameraPermissionDenied) }
+        XCTAssertEqual(output.ends, 1); XCTAssertEqual(time.pendingSleeps, 0)
+    }
     func testRetryBackoffReleasesAllHoldsBeforeAnotherAttempt() async throws {
         let time = VirtualClock(), source = HostSource(time), output = HostOutput(time)
         let c = PresencePlaybackController(output: output, clock: time.clock), a = try automation(source, time)
