@@ -14,7 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26-intel, macos-26]
+        # macOS 26 pools remained queued without runner assignment on 2026-09-18.
+        # Keep both native architectures and every validation step on supported pools.
+        include:
+          - runner: macos-15-intel
+            architecture: x86_64
+          - runner: macos-15
+            architecture: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     env:
@@ -27,6 +33,8 @@ jobs:
       - name: Toolchain
         run: |
           mkdir -p validation
+          test "$(uname -m)" = "${{ matrix.architecture }}"
+          git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD 'HEAD^{tree}' > validation/source-identity.txt
           swift --version | tee validation/toolchain.txt
           xcodebuild -version | tee -a validation/toolchain.txt
       - name: Debug tests
@@ -40,6 +48,7 @@ jobs:
           set -o pipefail
           bash scripts/build-app.sh 2>&1 | tee validation/package.log
           build/PresenceAgent.app/Contents/MacOS/PresenceAgent --self-test | tee -a validation/package.log
+          bash scripts/test-agent-options.sh | tee -a validation/package.log
       - name: Typecheck integration example
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
@@ -64,14 +73,42 @@ jobs:
         swift: ['6.0', '6.2']
     container: swift:${{ matrix.swift }}
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
+        id: checkout
         with:
           persist-credentials: false
-      - run: bash scripts/test-release.sh
-      - run: swift test
-      - run: swift test -c release
-      - run: swift run --package-path Examples/PackageClient -c release PackageClient
+      - name: Retain exact source and toolchain
+        run: |
+          set -o pipefail
+          mkdir -p validation
+          # checkout's temporary HOME does not persist its safe-directory entry.
+          # Trust only this job's workspace, never all repositories or global paths.
+          git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD 'HEAD^{tree}' > validation/source-identity.txt
+          git -c safe.directory="$GITHUB_WORKSPACE" archive --format=tar HEAD | gzip > validation/source.tar.gz
+          swift --version | tee validation/toolchain.txt
+      - name: Publication safety tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; bash scripts/test-release.sh 2>&1 | tee validation/publication.log
+      - name: Debug tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift test 2>&1 | tee validation/debug.log
+      - name: Release tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift test -c release 2>&1 | tee validation/release.log
+      - name: External package consumer
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: set -o pipefail; swift run --package-path Examples/PackageClient -c release PackageClient 2>&1 | tee validation/client.log
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-linux-${{ matrix.swift }}
+          path: validation/
+          retention-days: 14
   required:
     name: Release gate
     if: ${{ always() }}

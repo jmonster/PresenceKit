@@ -2,131 +2,206 @@
 import AppKit
 import AVKit
 import PresenceKit
+import PresencePlayback
 import os
 
-@main
-@MainActor
+@main @MainActor
 struct PresenceAgentMain {
     static func main() {
-        // CI smoke path: validate public API linkage without a camera, consent
-        // prompt, NSApplication event loop, display assertions, or media playback.
-        if CommandLine.arguments.contains("--self-test") {
-            do {
-                _ = try PresenceMonitor.camera()
-                print("PresenceAgent self-test passed (no camera opened)")
-            } catch {
-                print("PresenceAgent self-test failed: \(error)")
-                exit(1)
+        do {
+            if CommandLine.arguments.contains("--help") {
+                print("PresenceAgent [--media /path/movie.mp4] [--manage-display] [--keep-awake] [--human | --face] [--cpu-only] [--absence-seconds N] [--fallback motion|pause] [--fallback-grace-seconds N] [--input-grace-seconds N] [--loop]")
+                return
             }
-            return
+            if CommandLine.arguments.contains("--self-test") {
+                _ = try PresencePlayerController(player: AVPlayer())
+                print("PresenceAgent self-test passed (no camera opened or power changed)")
+                return
+            }
+            let options = try AgentOptions(arguments: Array(CommandLine.arguments.dropFirst()))
+            if CommandLine.arguments.contains("--check-config") {
+                print("PresenceAgent configuration is valid (no camera opened)"); return
+            }
+            let app = NSApplication.shared
+            let delegate = AgentDelegate(options: options)
+            app.delegate = delegate
+            withExtendedLifetime(delegate) { app.run() }
+        } catch {
+            print("PresenceAgent: \(error)"); exit(1)
         }
-        let app = NSApplication.shared
-        let delegate = AgentDelegate()
-        app.delegate = delegate
-        withExtendedLifetime(delegate) { app.run() }
     }
 }
 
 @MainActor
 final class AgentDelegate: NSObject, NSApplicationDelegate {
     private let log = Logger(subsystem: "io.github.jmonster.PresenceKit", category: "agent")
+    private let options: AgentOptions
     private var task: Task<Void, Never>?
-    private var source: CameraPresenceSource?
+    private var restartTask: Task<Void, Never>?
+    private var terminating = false
     private var item: NSStatusItem?
-    private var player: AVPlayer?
+    private var statusItem: NSMenuItem?
+    private var recoveryText = "Starting"
+    private var sensedText = "unknown"
+    private var activityText = "unknown"
+    private var recognitionText = "Mode: motion only"
+    private var diagnosticsTask: Task<Void, Never>?
+    private var controller: PresencePlayerController?
+    private var player: AVQueuePlayer?
+    private var looper: AVPlayerLooper?
     private var window: NSWindow?
-    private let power = DisplayPower()
-    private var manageDisplay = false
-    private var keepAwake = false
+
+    init(options: AgentOptions) { self.options = options }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        let args = CommandLine.arguments
-        manageDisplay = args.contains("--manage-display")
-        keepAwake = manageDisplay || args.contains("--keep-awake")
-        var config = PresenceConfiguration.lowPower
-        if args.contains("--human") { config.vision.mode = .humanRectangles }
-        if args.contains("--face") { config.vision.mode = .faceRectangles }
-        if config.vision.mode != .disabled { config.absenceDelay = .seconds(240) }
-        if args.contains("--cpu-only") { config.vision.compute = .cpuOnly }
-        if let i = args.firstIndex(of: "--absence-seconds"), i + 1 < args.count,
-           let seconds = Double(args[i + 1]), seconds.isFinite { config.absenceDelay = .seconds(seconds) }
-        if let i = args.firstIndex(of: "--media"), i + 1 < args.count {
-            let p = AVPlayer(url: URL(fileURLWithPath: args[i + 1]))
-            player = p
-            let view = AVPlayerView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
-            view.player = p
-            let w = NSWindow(contentRect: view.bounds, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            w.title = "PresenceKit Media Demo"; w.contentView = view; w.center()
-            window = w
-        }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "PK"
         let menu = NSMenu()
-        menu.addItem(withTitle: "PresenceKit", action: nil, keyEquivalent: "")
+        statusItem = menu.addItem(withTitle: "Starting", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
+        let retry = menu.addItem(withTitle: "Restart monitoring", action: #selector(restart), keyEquivalent: "r")
+        retry.target = self
+        let reload = menu.addItem(withTitle: "Reload media and restart", action: #selector(reloadMedia), keyEquivalent: "")
+        reload.target = self
+        let diagnostics = menu.addItem(withTitle: "Show diagnostics", action: #selector(showDiagnostics), keyEquivalent: "d")
+        diagnostics.target = self
         let quit = menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
-        quit.target = self; item.menu = menu; self.item = item
-        do {
-            let source = try CameraPresenceSource(configuration: config)
-            self.source = source
-            let monitor = try PresenceMonitor(source: source, configuration: config)
-            task = Task { [weak self] in
-                var backoff = 2.0
-                while !Task.isCancelled {
-                    do {
-                        try await monitor.run { [weak self] event in await self?.handle(event) }
-                    } catch is CancellationError { break }
-                    catch {
-                        self?.log.error("Monitoring stopped: \(String(describing: error), privacy: .public)")
-                        self?.power.close()
-                        if let error = error as? PresenceError,
-                           case .cameraPermissionDenied = error { break }
-                    }
-                    do { try await Task.sleep(for: .seconds(backoff)) } catch { break }
-                    backoff = min(60, backoff * 2)
-                }
-                self?.power.close()
-            }
-        } catch { log.error("\(String(describing: error), privacy: .public)") }
+        quit.target = self
+        item.menu = menu; self.item = item
+        start()
     }
 
-    private func handle(_ event: PresenceEvent) async {
-        switch event {
-        case .presenceChanged(let change):
-            item?.button?.toolTip = "PresenceKit: \(change.current.rawValue)"
-            log.info("Presence: \(change.current.rawValue, privacy: .public); reason: \(change.reason.rawValue, privacy: .public)")
-            if change.reason == .initial && keepAwake { power.beginMonitoring() }
-            switch change.current {
-            case .present:
-                window?.makeKeyAndOrderFront(nil)
-                player?.play()
-            case .absent, .unknown:
-                // Unknown is an explicit demo policy: pause media, but never force
-                // display sleep on failed sensing. Change this for your application.
-                player?.pause(); window?.orderOut(nil)
+    private func start() {
+        guard !terminating else { return }
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.player?.pause(); self.window?.orderOut(nil)
+                self.controller = nil
             }
-            if manageDisplay {
-                await source?.suppressMotion()
-                await power.apply(change.current)
+            do {
+                let player = self.player ?? AVQueuePlayer()
+                if self.player == nil, let path = options.mediaPath {
+                    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+                    guard FileManager.default.isReadableFile(atPath: url.path) else {
+                        throw PresencePlaybackError.media("The media file is not readable")
+                    }
+                    let asset = AVURLAsset(url: url)
+                    // Load before constructing AVPlayerLooper: zero or unknown
+                    // durations are rejected rather than triggering an ObjC exception.
+                    let duration = try await asset.load(.duration)
+                    let playable = try await asset.load(.isPlayable)
+                    try Task.checkCancellation()
+                    guard playable, duration.isNumeric, duration.seconds > 0, duration.seconds.isFinite else {
+                        throw PresencePlaybackError.media("Use a playable finite-duration local movie")
+                    }
+                    let template = AVPlayerItem(asset: asset)
+                    if options.loop { looper = AVPlayerLooper(player: player, templateItem: template) }
+                    else { player.insert(template, after: nil) }
+                    let view = AVPlayerView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
+                    view.player = player; view.controlsStyle = .none
+                    if window == nil {
+                        let w = NSWindow(contentRect: view.bounds, styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+                        w.title = "PresenceKit Player"; w.center(); window = w
+                    }
+                    window?.contentView = view
+                }
+                self.player = player
+                let controller = try PresencePlayerController(player: player, configuration: options.configuration,
+                    fallback: options.fallback, manageDisplay: options.manageDisplay, keepSystemAwake: options.keepAwake,
+                    userInputGraceSeconds: options.inputGraceSeconds) { [weak self] visible in
+                        if visible { self?.window?.orderFront(nil) }
+                        else { self?.window?.orderOut(nil) }
+                    }
+                self.controller = controller
+                try await controller.run { [weak self] event in self?.handle(event) }
+            } catch is CancellationError {
+                setStatus("Stopped")
+            } catch {
+                let message = "Stopped: \(error). Correct the problem, then Restart monitoring (or Reload media for a media error)."
+                log.error("\(message, privacy: .public)"); setStatus(message)
             }
-            if let source {
-                let s = await source.statistics()
-                log.info("Camera \(s.configuredWidth)x\(s.configuredHeight) @ \(s.configuredFPS) fps; motion \(s.lastMotionMilliseconds) ms; Vision \(s.visionStatus, privacy: .public), \(s.lastVisionMilliseconds) ms")
-            }
-        case .statusChanged(let status):
-            log.info("Sensing status: \(String(describing: status), privacy: .public)")
-        case .lightingChanged(_, let current):
-            log.info("Lighting: \(current.rawValue, privacy: .public)")
         }
     }
 
+    private func handle(_ event: PresenceAutomationEvent) {
+        switch event {
+        case .activityChanged(let activity):
+            activityText = activity.rawValue
+        case .sensing(.presenceChanged(let change)):
+            sensedText = change.current.rawValue
+        case .recovery(.monitoring): recoveryText = "Monitoring"
+        case .recovery(.retryScheduled(let attempt, let delay, let cause)):
+            recoveryText = "Retry \(attempt) in \(delay): \(cause)"
+        case .recovery(.failed(let error)):
+            recoveryText = "Stopped: \(error)"
+        case .modeChanged(let mode):
+            switch mode {
+            case .motionOnly: recognitionText = "Mode: motion only (stationary people may be missed)"
+            case .semantic: recognitionText = "Mode: motion + recognition"
+            case .motionFallback(let status): recognitionText = "Mode: motion fallback — \(status)"
+            case .unavailable(let status): recognitionText = "Paused: recognition required — \(status)"
+            }
+        case .recovery(.recovered): recoveryText = "Sensing recovered"
+        case .recovery(.suspended): recoveryText = "Suspended: system sleep or inactive session"
+        case .recovery(.stopped): recoveryText = "Stopped"
+        case .sensing(.statusChanged(.starting)):
+            recoveryText = "Starting / awaiting camera permission"
+        default: return
+        }
+        let text = recoveryText + " • sensed: " + sensedText + " • playback: " + activityText + " • " + recognitionText
+        log.info("\(text, privacy: .public)"); setStatus(text)
+    }
+    private func setStatus(_ text: String) {
+        statusItem?.title = text; item?.button?.toolTip = text
+    }
+    @objc private func restart() { scheduleRestart(reload: false) }
+    @objc private func reloadMedia() { scheduleRestart(reload: true) }
+    private func scheduleRestart(reload: Bool) {
+        guard restartTask == nil, !terminating else { return }
+        let old = task, diagnostics = diagnosticsTask
+        task = nil; old?.cancel(); diagnostics?.cancel()
+        restartTask = Task { [weak self] in
+            await old?.value; await diagnostics?.value
+            guard let self else { return }
+            self.restartTask = nil
+            guard !Task.isCancelled, !self.terminating else { return }
+            if reload {
+                self.looper?.disableLooping(); self.looper = nil
+                self.player?.removeAllItems(); self.player = nil
+            }
+            self.start()
+        }
+    }
+    @objc private func showDiagnostics() {
+        guard diagnosticsTask == nil, let controller, !terminating else { return }
+        diagnosticsTask = Task { [weak self] in
+            let stats = await controller.statistics(), camera = await controller.cameraStatistics()
+            guard let self else { return }
+            defer { self.diagnosticsTask = nil }
+            guard !Task.isCancelled, !self.terminating else { return }
+            var text = "Attempts: \(stats.attempts), retries: \(stats.retries); active sensing: \(stats.activeTime), inactive/backoff: \(stats.inactiveTime). Mode: \(stats.mode)"
+            if let camera {
+                text += "\nCapture: \(camera.configuredWidth)×\(camera.configuredHeight) @ \(camera.configuredFPS) fps. Analyzed: \(camera.analyzedFrames), dropped: \(camera.droppedFrames). Motion interval: \(camera.effectiveMotionInterval); Vision interval: \(camera.effectiveVisionInterval)."
+            }
+            self.log.info("\(text, privacy: .public)")
+            self.setStatus(text)
+        }
+    }
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let task else { power.close(); return .terminateNow }
-        self.task = nil
-        task.cancel()
-        Task { await task.value; power.close(); sender.reply(toApplicationShouldTerminate: true) }
+        guard !terminating else { return .terminateLater }
+        terminating = true
+        let old = task, restart = restartTask, diagnostics = diagnosticsTask
+        task = nil; restartTask = nil; diagnosticsTask = nil
+        old?.cancel(); restart?.cancel(); diagnostics?.cancel()
+        player?.pause(); window?.orderOut(nil)
+        Task {
+            await restart?.value; await old?.value; await diagnostics?.value
+            self.looper?.disableLooping(); self.looper = nil; self.player = nil
+            sender.reply(toApplicationShouldTerminate: true)
+        }
         return .terminateLater
     }
 }

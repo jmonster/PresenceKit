@@ -77,3 +77,33 @@ final class CallbackLatch<Value: Sendable>: @unchecked Sendable {
         }
     }
 }
+
+/// Health advances only with fresh analysis, never with startup, cached evidence,
+/// silence, callback latency, or slow driver teardown. This is diagnostic state;
+/// it does not change the low-level monitor's run-until-failure contract.
+struct SensingHealth {
+    private var began: ContinuousClock.Instant?
+    private var lastFrame: ContinuousClock.Instant?
+    private var lastAnalysis: ContinuousClock.Instant?
+    private var semanticDeadline: ContinuousClock.Instant?
+    private(set) var longest: Duration = .zero
+
+    mutating func observe(frame: ContinuousClock.Instant, analysis: ContinuousClock.Instant?,
+                          status: AnalysisStatus, recognition: RecognitionStatus,
+                          deadline: ContinuousClock.Instant?, configuration: PresenceConfiguration,
+                          now: ContinuousClock.Instant) {
+        let needsRecognition = configuration.vision.mode != .disabled
+        let gap = lastFrame.map { $0.duration(to: frame) >= configuration.sensorTimeout } ?? false
+        let analysisGap: Bool
+        if let old = lastAnalysis, let analysis { analysisGap = old.duration(to: analysis) >= configuration.sensorTimeout }
+        else { analysisGap = false }
+        let semanticGap = needsRecognition && semanticDeadline.map { now >= $0 } == true
+        if gap || analysisGap || semanticGap { began = nil }
+        lastFrame = frame; lastAnalysis = analysis; semanticDeadline = deadline
+        let fresh = analysis.map { $0 <= now && $0.duration(to: now) < configuration.sensorTimeout } ?? false
+        let semanticHealthy = !needsRecognition || (recognition == .active && deadline.map { now < $0 } != false)
+        guard fresh, status == .active || status == .throttled, semanticHealthy else { began = nil; return }
+        if began == nil { began = now }
+        if let began, let analysis { longest = max(longest, max(.zero, began.duration(to: min(now, analysis)))) }
+    }
+}

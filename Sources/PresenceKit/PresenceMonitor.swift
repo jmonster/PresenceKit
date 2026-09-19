@@ -7,6 +7,8 @@ public actor PresenceMonitor {
     private let configuration: PresenceConfiguration
     private let clock: PresenceClock
     private var reducer: PresenceReducer
+    private var health = SensingHealth()
+    var longestHealthyPeriod: Duration { health.longest }
     private var running = false
     private var accepting = false
     private var deliveredPresence: PresenceState = .unknown
@@ -30,7 +32,7 @@ public actor PresenceMonitor {
     /// cancellation. Buffer overflow fails instead of silently losing transitions.
     public func run(onEvent: @escaping @Sendable (PresenceEvent) async -> Void) async throws {
         guard !running else { throw PresenceError.alreadyRunning }
-        running = true
+        running = true; health = SensingHealth()
         reducer = PresenceReducer(config: configuration)
         deliveredPresence = .unknown; deliveredLighting = .unknown
         let pair = AsyncThrowingStream<PresenceEvent, Error>.makeStream(
@@ -144,7 +146,14 @@ public actor PresenceMonitor {
 
     private func accept(_ sample: PresenceSample) throws {
         guard accepting else { return }
-        for event in reducer.ingest(sample, now: clock.now) { try emit(event) }
+        let previous = reducer.lastFrame, now = clock.now
+        let events = reducer.ingest(sample, now: now)
+        if let frame = reducer.lastFrame, previous != frame {
+            health.observe(frame: frame, analysis: reducer.lastAnalysis, status: sample.analysisStatus,
+                recognition: sample.recognitionStatus, deadline: sample.recognitionDeadline,
+                configuration: configuration, now: now)
+        }
+        for event in events { try emit(event) }
     }
 
     private func deliver(_ event: PresenceEvent, to callback: @Sendable (PresenceEvent) async -> Void) async {
